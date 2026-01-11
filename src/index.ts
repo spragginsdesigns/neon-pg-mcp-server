@@ -1,10 +1,12 @@
 #!/usr/bin/env node
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
-	Server,
-	StdioTransport,
-	McpError,
-	ErrorCode
-} from "@modelcontextprotocol/sdk";
+	CallToolRequestSchema,
+	ListToolsRequestSchema,
+	ErrorCode,
+	McpError
+} from "@modelcontextprotocol/sdk/types.js";
 import pg from "pg";
 
 // Check for required environment variable
@@ -49,10 +51,10 @@ class NeonPostgresServer {
 
 	constructor() {
 		// Initialize MCP server
-		this.server = new Server({
-			name: "neon-pg-server",
-			version: "0.1.0"
-		});
+		this.server = new Server(
+			{ name: "neon-pg-server", version: "1.3.0" },
+			{ capabilities: { tools: {} } }
+		);
 
 		// Initialize PostgreSQL connection pool
 		this.pool = new pg.Pool({
@@ -77,87 +79,90 @@ class NeonPostgresServer {
 	}
 
 	private setupToolHandlers() {
-		// Register available tools
-		this.server.defineTools([
-			{
-				name: "query",
-				description: "Execute a SQL SELECT query and return the results",
-				parameters: {
-					type: "object",
-					properties: {
-						sql: {
-							type: "string",
-							description: "SQL SELECT query to execute"
-						},
-						params: {
-							type: "array",
-							description: "Query parameters (optional)",
-							items: {
-								type: "string"
+		// Register available tools list
+		this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+			tools: [
+				{
+					name: "query",
+					description: "Execute a SQL SELECT query and return the results",
+					inputSchema: {
+						type: "object",
+						properties: {
+							sql: {
+								type: "string",
+								description: "SQL SELECT query to execute"
+							},
+							params: {
+								type: "array",
+								description: "Query parameters (optional)",
+								items: { type: "string" }
 							}
-						}
-					},
-					required: ["sql"]
-				},
-				handler: async (args: QueryArgs) => {
-					return this.handleQuery(args);
-				}
-			},
-			{
-				name: "execute",
-				description:
-					"Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE)",
-				parameters: {
-					type: "object",
-					properties: {
-						sql: {
-							type: "string",
-							description: "SQL statement to execute"
 						},
-						params: {
-							type: "array",
-							description: "Statement parameters (optional)",
-							items: {
-								type: "string"
+						required: ["sql"]
+					}
+				},
+				{
+					name: "execute",
+					description: "Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE)",
+					inputSchema: {
+						type: "object",
+						properties: {
+							sql: {
+								type: "string",
+								description: "SQL statement to execute"
+							},
+							params: {
+								type: "array",
+								description: "Statement parameters (optional)",
+								items: { type: "string" }
 							}
-						}
-					},
-					required: ["sql"]
+						},
+						required: ["sql"]
+					}
 				},
-				handler: async (args: ExecuteArgs) => {
-					return this.handleExecute(args);
+				{
+					name: "get_tables",
+					description: "Get a list of tables in the database",
+					inputSchema: {
+						type: "object",
+						properties: {},
+						required: []
+					}
+				},
+				{
+					name: "describe_table",
+					description: "Get structure information about a specific table",
+					inputSchema: {
+						type: "object",
+						properties: {
+							table: {
+								type: "string",
+								description: "Name of the table to describe"
+							}
+						},
+						required: ["table"]
+					}
 				}
-			},
-			{
-				name: "get_tables",
-				description: "Get a list of tables in the database",
-				parameters: {
-					type: "object",
-					properties: {},
-					required: []
-				},
-				handler: async () => {
+			]
+		}));
+
+		// Handle tool invocations
+		this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+			const { name, arguments: args } = request.params;
+
+			switch (name) {
+				case "query":
+					return this.handleQuery(args as unknown as QueryArgs);
+				case "execute":
+					return this.handleExecute(args as unknown as ExecuteArgs);
+				case "get_tables":
 					return this.handleGetTables();
-				}
-			},
-			{
-				name: "describe_table",
-				description: "Get structure information about a specific table",
-				parameters: {
-					type: "object",
-					properties: {
-						table: {
-							type: "string",
-							description: "Name of the table to describe"
-						}
-					},
-					required: ["table"]
-				},
-				handler: async (args: DescribeTableArgs) => {
-					return this.handleDescribeTable(args);
-				}
+				case "describe_table":
+					return this.handleDescribeTable(args as unknown as DescribeTableArgs);
+				default:
+					throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
 			}
-		]);
+		});
 	}
 
 	private async handleQuery(args: QueryArgs) {
@@ -377,7 +382,7 @@ class NeonPostgresServer {
 			console.error("Successfully connected to Neon PostgreSQL database");
 
 			// Connect to MCP transport
-			const transport = new StdioTransport();
+			const transport = new StdioServerTransport();
 			await this.server.connect(transport);
 			console.error("Neon PostgreSQL MCP server running on stdio");
 		} catch (error) {
