@@ -123,7 +123,7 @@ const pool = new pg.Pool({
 });
 
 const server = new Server(
-  { name: "neon-pg", version: "1.5.0" },
+  { name: "neon-pg", version: "1.6.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -160,11 +160,14 @@ const TOOLS = [
   },
   {
     name: "get_schema",
-    description: "Get complete database schema - all tables, columns, types, keys, and JSON structures in one call. Use this FIRST to avoid column/table name errors.",
+    description: "Get database schema - tables, columns, types, keys, and JSON structures. By default excludes backup/archive tables and limits to 50 tables ordered by size. Use this FIRST to avoid column/table name errors.",
     inputSchema: {
       type: "object",
       properties: {
-        tables: { type: "array", items: { type: "string" }, description: "Specific tables to include (optional, defaults to all)" }
+        tables: { type: "array", items: { type: "string" }, description: "Specific tables to include (overrides limit/offset)" },
+        limit: { type: "number", description: "Max tables to return (default 50, max 200)" },
+        offset: { type: "number", description: "Skip first N tables for pagination (default 0)" },
+        include_all: { type: "boolean", description: "Include backup/archive tables (default false)" }
       }
     }
   },
@@ -296,129 +299,82 @@ async function handleGetTables() {
 }
 
 async function handleGetSchema(args) {
-  // Get all tables or filter by provided list
-  const tableFilter = args.tables?.length > 0
-    ? `AND t.table_name = ANY($1)`
-    : '';
-  const tableParams = args.tables?.length > 0 ? [args.tables] : [];
-
-  // Get all columns with types, PKs, and FKs in one efficient query
-  const schemaQuery = `
-    WITH table_list AS (
-      SELECT table_name
-      FROM information_schema.tables t
-      WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
-      ${tableFilter}
-    ),
-    columns AS (
-      SELECT
-        c.table_name,
-        c.column_name,
-        c.data_type,
-        c.udt_name,
-        c.is_nullable,
-        c.ordinal_position
-      FROM information_schema.columns c
-      WHERE c.table_schema = 'public'
-        AND c.table_name IN (SELECT table_name FROM table_list)
-    ),
-    pks AS (
-      SELECT tc.table_name, kcu.column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
-      WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
-        AND tc.table_name IN (SELECT table_name FROM table_list)
-    ),
-    fks AS (
-      SELECT tc.table_name, kcu.column_name, ccu.table_name as ref_table, ccu.column_name as ref_col
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
-      JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
-      WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
-        AND tc.table_name IN (SELECT table_name FROM table_list)
-    )
-    SELECT
-      c.table_name,
-      c.column_name,
-      c.data_type,
-      c.udt_name,
-      c.is_nullable,
-      CASE WHEN p.column_name IS NOT NULL THEN true ELSE false END as is_pk,
-      f.ref_table,
-      f.ref_col
-    FROM columns c
-    LEFT JOIN pks p ON c.table_name = p.table_name AND c.column_name = p.column_name
-    LEFT JOIN fks f ON c.table_name = f.table_name AND c.column_name = f.column_name
-    ORDER BY c.table_name, c.ordinal_position
+  // Build exclusion clause for backup/archive tables
+  const includeAll = args.include_all === true;
+  const excludeClause = includeAll ? '' : `
+    AND c.relname NOT LIKE '%_backup%'
+    AND c.relname NOT LIKE '%_archive%'
+    AND c.relname NOT LIKE '%_bak_%'
+    AND c.relname NOT LIKE '%_old_%'
+    AND c.relname !~ '_\\d{6,8}$'
   `;
 
-  const result = await pool.query(schemaQuery, tableParams);
+  // Specific tables override limit/offset
+  const hasSpecificTables = args.tables?.length > 0;
+  const tableFilter = hasSpecificTables ? `AND c.relname = ANY($1)` : '';
 
-  // Group by table and build compact schema
-  const tables = {};
-  const jsonbColumns = []; // Track JSONB columns for structure sampling
+  // Pagination
+  const limit = hasSpecificTables ? 200 : Math.min(Math.max(1, args.limit || 50), 200);
+  const offset = hasSpecificTables ? 0 : Math.max(0, args.offset || 0);
 
-  for (const row of result.rows) {
-    if (!tables[row.table_name]) {
-      tables[row.table_name] = [];
-    }
+  const query = `
+    SELECT
+      c.relname as table_name,
+      pg_size_pretty(pg_total_relation_size(c.oid)) as size,
+      pg_total_relation_size(c.oid) as size_bytes,
+      c.reltuples::bigint as row_estimate,
+      obj_description(c.oid) as comment,
+      (SELECT count(*) FROM information_schema.columns ic
+       WHERE ic.table_name = c.relname AND ic.table_schema = 'public') as col_count
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind = 'r'
+      ${tableFilter}
+      ${excludeClause}
+    ORDER BY pg_total_relation_size(c.oid) DESC
+    LIMIT ${limit} OFFSET ${offset}
+  `;
 
-    // Build compact column definition
-    let colDef = row.column_name;
-    let type = row.data_type === 'USER-DEFINED' ? row.udt_name : row.data_type;
+  const params = hasSpecificTables ? [args.tables] : [];
+  const result = await pool.query(query, params);
 
-    // Shorten common types
-    type = type.replace('character varying', 'varchar')
-               .replace('timestamp with time zone', 'timestamptz')
-               .replace('timestamp without time zone', 'timestamp')
-               .replace('double precision', 'float8');
+  // Get total count for pagination info
+  const countQuery = `
+    SELECT count(*) as total
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public' AND c.relkind = 'r'
+    ${excludeClause}
+  `;
+  const countResult = await pool.query(countQuery);
+  const totalTables = parseInt(countResult.rows[0].total);
 
-    colDef += `(${type}`;
-    if (row.is_pk) colDef += ' PK';
-    if (row.is_nullable === 'NO' && !row.is_pk) colDef += ' NOT NULL';
-    if (row.ref_table) colDef += `->${ row.ref_table}.${row.ref_col}`;
-    colDef += ')';
+  // Build structured output
+  const tables = result.rows.map(row => {
+    const table = {
+      name: row.table_name,
+      size: row.size,
+      rows: row.row_estimate,
+      columns: parseInt(row.col_count)
+    };
+    if (row.comment) table.comment = row.comment;
+    return table;
+  });
 
-    tables[row.table_name].push(colDef);
-
-    // Track JSONB columns for structure sampling
-    if (row.data_type === 'jsonb') {
-      jsonbColumns.push({ table: row.table_name, column: row.column_name });
-    }
-  }
-
-  // Sample JSONB structures with full recursive introspection (limit to first 30 to avoid timeout)
-  const jsonbStructures = {};
-  for (const jcol of jsonbColumns.slice(0, 30)) {
-    try {
-      // Get a sample row and extract full nested structure
-      const sampleResult = await pool.query(`
-        SELECT ${jcol.column} as data
-        FROM ${jcol.table}
-        WHERE ${jcol.column} IS NOT NULL
-        LIMIT 1
-      `);
-
-      if (sampleResult.rows.length > 0 && sampleResult.rows[0].data) {
-        const sample = sampleResult.rows[0].data;
-        const structure = extractJsonStructure(sample, 6); // Recurse up to 6 levels deep
-
-        if (!jsonbStructures[jcol.table]) jsonbStructures[jcol.table] = {};
-        jsonbStructures[jcol.table][jcol.column] = structure;
-      }
-    } catch (e) {
-      // Skip columns that error
-    }
-  }
-
-  // Build output - compact format
   const output = {
-    schema: {},
-    jsonb_structures: jsonbStructures
+    tables,
+    pagination: {
+      returned: tables.length,
+      total: totalTables,
+      offset,
+      limit,
+      has_more: offset + tables.length < totalTables
+    }
   };
 
-  for (const [tableName, columns] of Object.entries(tables)) {
-    output.schema[tableName] = columns.join(', ');
+  if (!includeAll) {
+    output.note = "Backup/archive tables excluded. Use include_all:true to see all.";
   }
 
   return {
@@ -661,7 +617,7 @@ async function handleSearchSchema(args) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("neon-pg MCP v1.5.0");
+console.error("neon-pg MCP v1.6.0");
 
 process.on('SIGINT', async () => { await pool.end(); process.exit(0); });
 process.on('SIGTERM', async () => { await pool.end(); process.exit(0); });
