@@ -11,6 +11,109 @@ if (!CONNECTION_STRING) {
 const MAX_ROWS = 100;
 const QUERY_TIMEOUT = 30000;
 
+// Helper: Calculate Levenshtein distance for fuzzy matching
+function levenshtein(a, b) {
+  const matrix = Array(b.length + 1).fill(null).map(() => Array(a.length + 1).fill(null));
+  for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
+  for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
+  for (let j = 1; j <= b.length; j++) {
+    for (let i = 1; i <= a.length; i++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      matrix[j][i] = Math.min(matrix[j][i - 1] + 1, matrix[j - 1][i] + 1, matrix[j - 1][i - 1] + cost);
+    }
+  }
+  return matrix[b.length][a.length];
+}
+
+// Helper: Find similar names from a list
+function findSimilar(target, candidates, maxDistance = 3) {
+  target = target.toLowerCase();
+  return candidates
+    .map(c => ({ name: c, distance: levenshtein(target, c.toLowerCase()) }))
+    .filter(c => c.distance <= maxDistance && c.distance > 0)
+    .sort((a, b) => a.distance - b.distance)
+    .slice(0, 5)
+    .map(c => c.name);
+}
+
+// Helper: Get all table names (cached for error suggestions)
+let cachedTables = null;
+let cachedColumns = null;
+async function getSchemaCache() {
+  if (!cachedTables) {
+    const tablesResult = await pool.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    `);
+    cachedTables = tablesResult.rows.map(r => r.table_name);
+
+    const columnsResult = await pool.query(`
+      SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+    `);
+    cachedColumns = columnsResult.rows;
+  }
+  return { tables: cachedTables, columns: cachedColumns };
+}
+
+// Helper: Parse PostgreSQL error and add suggestions
+async function enhanceError(error, sql) {
+  const msg = error.message || '';
+  const { tables, columns } = await getSchemaCache();
+
+  // Column not found
+  let match = msg.match(/column "([^"]+)" does not exist/i);
+  if (match) {
+    const badCol = match[1];
+    // Try to find the table from the SQL
+    const tableMatch = sql.match(/from\s+([a-z_][a-z0-9_]*)/i) || sql.match(/update\s+([a-z_][a-z0-9_]*)/i);
+    const tableName = tableMatch ? tableMatch[1] : null;
+
+    let suggestions = [];
+    if (tableName) {
+      const tableCols = columns.filter(c => c.table_name === tableName).map(c => c.column_name);
+      suggestions = findSimilar(badCol, tableCols);
+      return `Column "${badCol}" does not exist in table "${tableName}"\n\nDid you mean: ${suggestions.length > 0 ? suggestions.join(', ') : '(no similar columns)'}\n\nAvailable columns in ${tableName}: ${tableCols.join(', ')}`;
+    } else {
+      // Search all columns
+      const allCols = [...new Set(columns.map(c => c.column_name))];
+      suggestions = findSimilar(badCol, allCols);
+      return `Column "${badCol}" does not exist\n\nDid you mean: ${suggestions.length > 0 ? suggestions.join(', ') : '(no similar columns)'}`;
+    }
+  }
+
+  // Table/relation not found
+  match = msg.match(/relation "([^"]+)" does not exist/i);
+  if (match) {
+    const badTable = match[1];
+    const suggestions = findSimilar(badTable, tables);
+    return `Table "${badTable}" does not exist\n\nDid you mean: ${suggestions.length > 0 ? suggestions.join(', ') : '(no similar tables)'}\n\nAvailable tables: ${tables.slice(0, 20).join(', ')}${tables.length > 20 ? '...' : ''}`;
+  }
+
+  // Return original message if no enhancement
+  return msg;
+}
+
+// Helper: Recursively extract JSONB structure with types
+function extractJsonStructure(obj, maxDepth = 5, currentDepth = 0) {
+  if (currentDepth >= maxDepth) return '...';
+  if (obj === null) return 'null';
+  if (Array.isArray(obj)) {
+    if (obj.length === 0) return '[]';
+    // Sample first element to show array item structure
+    const itemStructure = extractJsonStructure(obj[0], maxDepth, currentDepth + 1);
+    return [itemStructure];
+  }
+  if (typeof obj === 'object') {
+    const structure = {};
+    for (const [key, value] of Object.entries(obj)) {
+      structure[key] = extractJsonStructure(value, maxDepth, currentDepth + 1);
+    }
+    return structure;
+  }
+  return typeof obj;
+}
+
 const pool = new pg.Pool({
   connectionString: CONNECTION_STRING,
   ssl: { rejectUnauthorized: true },
@@ -20,11 +123,11 @@ const pool = new pg.Pool({
 });
 
 const server = new Server(
-  { name: "neon-pg", version: "1.3.0" },
+  { name: "neon-pg", version: "1.5.0" },
   { capabilities: { tools: {} } }
 );
 
-// Minimal tool definitions - 4 tools only
+// Tool definitions - 7 tools
 const TOOLS = [
   {
     name: "query",
@@ -56,6 +159,16 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {}, required: [] }
   },
   {
+    name: "get_schema",
+    description: "Get complete database schema - all tables, columns, types, keys, and JSON structures in one call. Use this FIRST to avoid column/table name errors.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tables: { type: "array", items: { type: "string" }, description: "Specific tables to include (optional, defaults to all)" }
+      }
+    }
+  },
+  {
     name: "describe_table",
     description: "Get structure information about a specific table",
     inputSchema: {
@@ -64,6 +177,30 @@ const TOOLS = [
         table: { type: "string", description: "Name of the table to describe" }
       },
       required: ["table"]
+    }
+  },
+  {
+    name: "sample_data",
+    description: "Get sample rows from a table to see actual data format, JSON structures, and real values",
+    inputSchema: {
+      type: "object",
+      properties: {
+        table: { type: "string", description: "Table name to sample from" },
+        limit: { type: "number", description: "Number of rows to return (default 3, max 10)" },
+        where: { type: "string", description: "Optional WHERE clause (without 'WHERE' keyword)" }
+      },
+      required: ["table"]
+    }
+  },
+  {
+    name: "search_schema",
+    description: "Search for tables and columns by name pattern. Use when you know the concept but not exact name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "Search pattern (case-insensitive, searches table and column names)" }
+      },
+      required: ["pattern"]
     }
   }
 ];
@@ -77,7 +214,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "query": return await handleQuery(args);
     case "execute": return await handleExecute(args);
     case "get_tables": return await handleGetTables();
+    case "get_schema": return await handleGetSchema(args);
     case "describe_table": return await handleDescribeTable(args);
+    case "sample_data": return await handleSampleData(args);
+    case "search_schema": return await handleSearchSchema(args);
     default: throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
   }
 });
@@ -91,18 +231,24 @@ async function handleQuery(args) {
   }
 
   const sql = lower.includes(' limit ') ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
-  const result = await pool.query({ text: sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
 
-  return {
-    content: [{
-      type: "text",
-      text: JSON.stringify({
-        rowCount: result.rowCount,
-        rows: result.rows,
-        fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID }))
-      }, null, 2)
-    }]
-  };
+  try {
+    const result = await pool.query({ text: sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          rowCount: result.rowCount,
+          rows: result.rows,
+          fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID }))
+        }, null, 2)
+      }]
+    };
+  } catch (error) {
+    const enhanced = await enhanceError(error, args.sql);
+    throw new McpError(ErrorCode.InvalidParams, enhanced);
+  }
 }
 
 async function handleExecute(args) {
@@ -112,17 +258,22 @@ async function handleExecute(args) {
     throw new McpError(ErrorCode.InvalidParams, "Use query tool for SELECT");
   }
 
-  const result = await pool.query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
+  try {
+    const result = await pool.query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
 
-  return {
-    content: [{
-      type: "text",
-      text: JSON.stringify({
-        command: result.command,
-        rowCount: result.rowCount
-      }, null, 2)
-    }]
-  };
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          command: result.command,
+          rowCount: result.rowCount
+        }, null, 2)
+      }]
+    };
+  } catch (error) {
+    const enhanced = await enhanceError(error, args.sql);
+    throw new McpError(ErrorCode.InvalidParams, enhanced);
+  }
 }
 
 async function handleGetTables() {
@@ -140,6 +291,140 @@ async function handleGetTables() {
     content: [{
       type: "text",
       text: JSON.stringify({ tables: result.rows }, null, 2)
+    }]
+  };
+}
+
+async function handleGetSchema(args) {
+  // Get all tables or filter by provided list
+  const tableFilter = args.tables?.length > 0
+    ? `AND t.table_name = ANY($1)`
+    : '';
+  const tableParams = args.tables?.length > 0 ? [args.tables] : [];
+
+  // Get all columns with types, PKs, and FKs in one efficient query
+  const schemaQuery = `
+    WITH table_list AS (
+      SELECT table_name
+      FROM information_schema.tables t
+      WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE'
+      ${tableFilter}
+    ),
+    columns AS (
+      SELECT
+        c.table_name,
+        c.column_name,
+        c.data_type,
+        c.udt_name,
+        c.is_nullable,
+        c.ordinal_position
+      FROM information_schema.columns c
+      WHERE c.table_schema = 'public'
+        AND c.table_name IN (SELECT table_name FROM table_list)
+    ),
+    pks AS (
+      SELECT tc.table_name, kcu.column_name
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+      WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = 'public'
+        AND tc.table_name IN (SELECT table_name FROM table_list)
+    ),
+    fks AS (
+      SELECT tc.table_name, kcu.column_name, ccu.table_name as ref_table, ccu.column_name as ref_col
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
+      JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name
+      WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = 'public'
+        AND tc.table_name IN (SELECT table_name FROM table_list)
+    )
+    SELECT
+      c.table_name,
+      c.column_name,
+      c.data_type,
+      c.udt_name,
+      c.is_nullable,
+      CASE WHEN p.column_name IS NOT NULL THEN true ELSE false END as is_pk,
+      f.ref_table,
+      f.ref_col
+    FROM columns c
+    LEFT JOIN pks p ON c.table_name = p.table_name AND c.column_name = p.column_name
+    LEFT JOIN fks f ON c.table_name = f.table_name AND c.column_name = f.column_name
+    ORDER BY c.table_name, c.ordinal_position
+  `;
+
+  const result = await pool.query(schemaQuery, tableParams);
+
+  // Group by table and build compact schema
+  const tables = {};
+  const jsonbColumns = []; // Track JSONB columns for structure sampling
+
+  for (const row of result.rows) {
+    if (!tables[row.table_name]) {
+      tables[row.table_name] = [];
+    }
+
+    // Build compact column definition
+    let colDef = row.column_name;
+    let type = row.data_type === 'USER-DEFINED' ? row.udt_name : row.data_type;
+
+    // Shorten common types
+    type = type.replace('character varying', 'varchar')
+               .replace('timestamp with time zone', 'timestamptz')
+               .replace('timestamp without time zone', 'timestamp')
+               .replace('double precision', 'float8');
+
+    colDef += `(${type}`;
+    if (row.is_pk) colDef += ' PK';
+    if (row.is_nullable === 'NO' && !row.is_pk) colDef += ' NOT NULL';
+    if (row.ref_table) colDef += `->${ row.ref_table}.${row.ref_col}`;
+    colDef += ')';
+
+    tables[row.table_name].push(colDef);
+
+    // Track JSONB columns for structure sampling
+    if (row.data_type === 'jsonb') {
+      jsonbColumns.push({ table: row.table_name, column: row.column_name });
+    }
+  }
+
+  // Sample JSONB structures with full recursive introspection (limit to first 30 to avoid timeout)
+  const jsonbStructures = {};
+  for (const jcol of jsonbColumns.slice(0, 30)) {
+    try {
+      // Get a sample row and extract full nested structure
+      const sampleResult = await pool.query(`
+        SELECT ${jcol.column} as data
+        FROM ${jcol.table}
+        WHERE ${jcol.column} IS NOT NULL
+        LIMIT 1
+      `);
+
+      if (sampleResult.rows.length > 0 && sampleResult.rows[0].data) {
+        const sample = sampleResult.rows[0].data;
+        const structure = extractJsonStructure(sample, 6); // Recurse up to 6 levels deep
+
+        if (!jsonbStructures[jcol.table]) jsonbStructures[jcol.table] = {};
+        jsonbStructures[jcol.table][jcol.column] = structure;
+      }
+    } catch (e) {
+      // Skip columns that error
+    }
+  }
+
+  // Build output - compact format
+  const output = {
+    schema: {},
+    jsonb_structures: jsonbStructures
+  };
+
+  for (const [tableName, columns] of Object.entries(tables)) {
+    output.schema[tableName] = columns.join(', ');
+  }
+
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(output, null, 2)
     }]
   };
 }
@@ -260,9 +545,123 @@ async function handleDescribeTable(args) {
   };
 }
 
+async function handleSampleData(args) {
+  if (!args.table) throw new McpError(ErrorCode.InvalidParams, "table required");
+
+  const { tables } = await getSchemaCache();
+  if (!tables.includes(args.table)) {
+    const suggestions = findSimilar(args.table, tables);
+    throw new McpError(ErrorCode.InvalidParams,
+      `Table "${args.table}" not found\n\nDid you mean: ${suggestions.length > 0 ? suggestions.join(', ') : '(no similar tables)'}`);
+  }
+
+  const limit = Math.min(Math.max(1, args.limit || 3), 10);
+  const whereClause = args.where ? `WHERE ${args.where}` : '';
+
+  try {
+    const result = await pool.query(`
+      SELECT * FROM ${args.table}
+      ${whereClause}
+      LIMIT ${limit}
+    `);
+
+    // For each JSONB column, extract structure from the results
+    const jsonbStructures = {};
+    if (result.rows.length > 0) {
+      const firstRow = result.rows[0];
+      for (const [key, value] of Object.entries(firstRow)) {
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+          // Check if this looks like a JSON object (not a Date or other special object)
+          if (value.constructor === Object || Array.isArray(value)) {
+            jsonbStructures[key] = extractJsonStructure(value, 6);
+          }
+        } else if (Array.isArray(value)) {
+          jsonbStructures[key] = extractJsonStructure(value, 6);
+        }
+      }
+    }
+
+    const output = {
+      table: args.table,
+      rowCount: result.rowCount,
+      rows: result.rows
+    };
+
+    if (Object.keys(jsonbStructures).length > 0) {
+      output.jsonb_structures = jsonbStructures;
+    }
+
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify(output, null, 2)
+      }]
+    };
+  } catch (error) {
+    const enhanced = await enhanceError(error, `SELECT * FROM ${args.table} ${whereClause}`);
+    throw new McpError(ErrorCode.InvalidParams, enhanced);
+  }
+}
+
+async function handleSearchSchema(args) {
+  if (!args.pattern) throw new McpError(ErrorCode.InvalidParams, "pattern required");
+
+  const pattern = args.pattern.toLowerCase();
+
+  // Search tables and columns
+  const result = await pool.query(`
+    SELECT
+      t.table_name,
+      c.column_name,
+      c.data_type,
+      c.udt_name
+    FROM information_schema.tables t
+    JOIN information_schema.columns c ON t.table_name = c.table_name AND t.table_schema = c.table_schema
+    WHERE t.table_schema = 'public'
+      AND t.table_type = 'BASE TABLE'
+      AND (
+        LOWER(t.table_name) LIKE $1
+        OR LOWER(c.column_name) LIKE $1
+      )
+    ORDER BY
+      CASE WHEN LOWER(t.table_name) LIKE $1 THEN 0 ELSE 1 END,
+      t.table_name,
+      c.ordinal_position
+  `, [`%${pattern}%`]);
+
+  // Group results
+  const matchingTables = new Set();
+  const matchingColumns = [];
+
+  for (const row of result.rows) {
+    if (row.table_name.toLowerCase().includes(pattern)) {
+      matchingTables.add(row.table_name);
+    }
+    if (row.column_name.toLowerCase().includes(pattern)) {
+      let type = row.data_type === 'USER-DEFINED' ? row.udt_name : row.data_type;
+      type = type.replace('character varying', 'varchar')
+                 .replace('timestamp with time zone', 'timestamptz');
+      matchingColumns.push(`${row.table_name}.${row.column_name}(${type})`);
+    }
+  }
+
+  const output = {
+    pattern: args.pattern,
+    matching_tables: [...matchingTables],
+    matching_columns: matchingColumns
+  };
+
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify(output, null, 2)
+    }]
+  };
+}
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("neon-pg MCP v1.3.0");
+console.error("neon-pg MCP v1.5.0");
 
 process.on('SIGINT', async () => { await pool.end(); process.exit(0); });
 process.on('SIGTERM', async () => { await pool.end(); process.exit(0); });
