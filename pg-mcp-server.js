@@ -229,11 +229,11 @@ async function handleQuery(args) {
   if (!args.sql) throw new McpError(ErrorCode.InvalidParams, "sql required");
 
   const lower = args.sql.trim().toLowerCase();
-  if (!lower.startsWith('select') && !lower.startsWith('with')) {
-    throw new McpError(ErrorCode.InvalidParams, "Use SELECT or WITH queries only");
+  if (!lower.startsWith('select') && !lower.startsWith('with') && !lower.startsWith('explain')) {
+    throw new McpError(ErrorCode.InvalidParams, "Use SELECT, WITH, or EXPLAIN queries only");
   }
 
-  const sql = lower.includes(' limit ') ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
+  const sql = lower.startsWith('explain') || lower.includes(' limit ') ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
 
   try {
     const result = await pool.query({ text: sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });

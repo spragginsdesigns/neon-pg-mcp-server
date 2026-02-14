@@ -172,10 +172,10 @@ class NeonPostgresServer {
 
 		// Validate that the query is a SELECT statement to prevent misuse
 		const trimmedSql = args.sql.trim().toLowerCase();
-		if (!trimmedSql.startsWith("select") && !trimmedSql.startsWith("with")) {
+		if (!trimmedSql.startsWith("select") && !trimmedSql.startsWith("with") && !trimmedSql.startsWith("explain")) {
 			throw new McpError(
 				ErrorCode.InvalidParams,
-				"Query must be a SELECT statement or a WITH query"
+				"Query must be a SELECT, WITH, or EXPLAIN statement"
 			);
 		}
 
