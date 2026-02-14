@@ -36,11 +36,28 @@ function findSimilar(target, candidates, maxDistance = 3) {
     .map(c => c.name);
 }
 
+// Helper: Validate identifier is safe for SQL interpolation
+const SAFE_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+function assertSafeIdentifier(name, kind = 'identifier') {
+  if (!SAFE_IDENTIFIER.test(name)) {
+    throw new McpError(ErrorCode.InvalidParams, `Invalid ${kind}: "${name}" contains unsafe characters`);
+  }
+}
+
 // Helper: Get all table names (cached for error suggestions)
 let cachedTables = null;
 let cachedColumns = null;
+let cacheTimestamp = 0;
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function invalidateSchemaCache() {
+  cachedTables = null;
+  cachedColumns = null;
+  cacheTimestamp = 0;
+}
+
 async function getSchemaCache() {
-  if (!cachedTables) {
+  if (!cachedTables || Date.now() - cacheTimestamp > CACHE_TTL) {
     const tablesResult = await pool.query(`
       SELECT table_name FROM information_schema.tables
       WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
@@ -52,6 +69,7 @@ async function getSchemaCache() {
       WHERE table_schema = 'public'
     `);
     cachedColumns = columnsResult.rows;
+    cacheTimestamp = Date.now();
   }
   return { tables: cachedTables, columns: cachedColumns };
 }
@@ -123,7 +141,7 @@ const pool = new pg.Pool({
 });
 
 const server = new Server(
-  { name: "neon-pg", version: "1.6.0" },
+  { name: "neon-pg", version: "1.7.0" },
   { capabilities: { tools: {} } }
 );
 
@@ -184,13 +202,12 @@ const TOOLS = [
   },
   {
     name: "sample_data",
-    description: "Get sample rows from a table to see actual data format, JSON structures, and real values",
+    description: "Get sample rows from a table to see actual data format, JSON structures, and real values. Use the query tool for filtered results.",
     inputSchema: {
       type: "object",
       properties: {
         table: { type: "string", description: "Table name to sample from" },
-        limit: { type: "number", description: "Number of rows to return (default 3, max 10)" },
-        where: { type: "string", description: "Optional WHERE clause (without 'WHERE' keyword)" }
+        limit: { type: "number", description: "Number of rows to return (default 3, max 10)" }
       },
       required: ["table"]
     }
@@ -233,19 +250,26 @@ async function handleQuery(args) {
     throw new McpError(ErrorCode.InvalidParams, "Use SELECT, WITH, or EXPLAIN queries only");
   }
 
-  const sql = lower.startsWith('explain') || lower.includes(' limit ') ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
+  const hasUserLimit = lower.startsWith('explain') || lower.includes(' limit ');
+  const sql = hasUserLimit ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
 
   try {
     const result = await pool.query({ text: sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
 
+    const response = {
+      rowCount: result.rowCount,
+      rows: result.rows,
+      fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID }))
+    };
+
+    if (!hasUserLimit && result.rowCount >= MAX_ROWS) {
+      response.warning = `Results truncated at ${MAX_ROWS} rows. Add an explicit LIMIT clause or use WHERE to narrow results.`;
+    }
+
     return {
       content: [{
         type: "text",
-        text: JSON.stringify({
-          rowCount: result.rowCount,
-          rows: result.rows,
-          fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID }))
-        }, null, 2)
+        text: JSON.stringify(response, null, 2)
       }]
     };
   } catch (error) {
@@ -263,6 +287,12 @@ async function handleExecute(args) {
 
   try {
     const result = await pool.query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
+
+    // Invalidate schema cache on DDL statements
+    const firstWord = args.sql.trim().split(/\s+/)[0].toUpperCase();
+    if (['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME'].includes(firstWord)) {
+      invalidateSchemaCache();
+    }
 
     return {
       content: [{
@@ -387,6 +417,7 @@ async function handleGetSchema(args) {
 
 async function handleDescribeTable(args) {
   if (!args.table) throw new McpError(ErrorCode.InvalidParams, "table required");
+  assertSafeIdentifier(args.table, 'table name');
 
   const [cols, pks, fks, idxs, stats] = await Promise.all([
     // Get columns with enum type names
@@ -457,6 +488,7 @@ async function handleDescribeTable(args) {
 
   for (const jcol of jsonbCols) {
     try {
+      assertSafeIdentifier(jcol.col, 'column name');
       const keysResult = await pool.query(`
         SELECT DISTINCT jsonb_object_keys(${jcol.col}) as key
         FROM ${args.table}
@@ -511,13 +543,13 @@ async function handleSampleData(args) {
       `Table "${args.table}" not found\n\nDid you mean: ${suggestions.length > 0 ? suggestions.join(', ') : '(no similar tables)'}`);
   }
 
+  assertSafeIdentifier(args.table, 'table name');
+
   const limit = Math.min(Math.max(1, args.limit || 3), 10);
-  const whereClause = args.where ? `WHERE ${args.where}` : '';
 
   try {
     const result = await pool.query(`
       SELECT * FROM ${args.table}
-      ${whereClause}
       LIMIT ${limit}
     `);
 
@@ -554,7 +586,7 @@ async function handleSampleData(args) {
       }]
     };
   } catch (error) {
-    const enhanced = await enhanceError(error, `SELECT * FROM ${args.table} ${whereClause}`);
+    const enhanced = await enhanceError(error, `SELECT * FROM ${args.table}`);
     throw new McpError(ErrorCode.InvalidParams, enhanced);
   }
 }
@@ -617,7 +649,7 @@ async function handleSearchSchema(args) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("neon-pg MCP v1.6.0");
+console.error("neon-pg MCP v1.7.0");
 
 process.on('SIGINT', async () => { await pool.end(); process.exit(0); });
 process.on('SIGTERM', async () => { await pool.end(); process.exit(0); });
