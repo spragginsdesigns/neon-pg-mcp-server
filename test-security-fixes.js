@@ -160,22 +160,24 @@ test('handleSampleData has no whereClause', () => {
 });
 
 test('sample_data validates table identifier', () => {
-  const handleMatch = serverSource.match(/async function handleSampleData[\s\S]*?^}/m);
-  assert(handleMatch[0].includes("assertSafeIdentifier(args.table, 'table name')"), 'should validate table name');
+  const helperMatch = serverSource.match(/async function getSampleData[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getSampleData');
+  assert(helperMatch[0].includes("assertSafeIdentifier(tableName, 'table name')"), 'should validate table name');
 });
 
 // ── describe_table security ──
 console.error('\n── describe_table security ──');
 
 test('describe_table validates table identifier', () => {
-  const handleMatch = serverSource.match(/async function handleDescribeTable[\s\S]*?^}/m);
-  assert(handleMatch, 'should find handleDescribeTable');
-  assert(handleMatch[0].includes("assertSafeIdentifier(args.table, 'table name')"), 'should validate table name');
+  const helperMatch = serverSource.match(/async function getTableDescription[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getTableDescription');
+  assert(helperMatch[0].includes("assertSafeIdentifier(tableName, 'table name')"), 'should validate table name');
 });
 
 test('JSONB loop validates column identifier', () => {
-  const handleMatch = serverSource.match(/async function handleDescribeTable[\s\S]*?^}/m);
-  assert(handleMatch[0].includes("assertSafeIdentifier(jcol.col, 'column name')"), 'should validate column name in JSONB loop');
+  const helperMatch = serverSource.match(/async function getTableDescription[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getTableDescription');
+  assert(helperMatch[0].includes("assertSafeIdentifier(jcol.col, 'column name')"), 'should validate column name in JSONB loop');
 });
 
 // ── Version ──
@@ -187,6 +189,79 @@ test('server version is 1.7.0', () => {
 
 test('startup log is v1.7.0', () => {
   assert(serverSource.includes('neon-pg MCP v1.7.0'), 'startup log should be v1.7.0');
+});
+
+// ── Structured MCP outputs ──
+console.error('\n── structuredContent & outputSchema ──');
+
+test('tool definitions include output schemas', () => {
+  assert(serverSource.includes('outputSchema: QUERY_RESULT_SCHEMA'), 'query should expose outputSchema');
+  assert(serverSource.includes('outputSchema: EXECUTE_RESULT_SCHEMA'), 'execute should expose outputSchema');
+  assert(serverSource.includes('outputSchema: SCHEMA_OVERVIEW_RESULT_SCHEMA'), 'get_schema should expose outputSchema');
+});
+
+test('server source returns structuredContent from tools', () => {
+  assert(serverSource.includes('structuredContent: data'), 'should include structuredContent helper');
+  assert(serverSource.includes('return createStructuredToolResult(response);'), 'query should return structured results');
+  assert(serverSource.includes('return createStructuredToolResult(await getTablesSummary());'), 'get_tables should return structured results');
+});
+
+test('tool errors can include structured content', () => {
+  assert(serverSource.includes('result.structuredContent = structuredContent'), 'error helper should include structured content');
+  assert(serverSource.includes('return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });'), 'tool errors should return structured details');
+});
+
+// ── MCP resources ──
+console.error('\n── MCP resources ──');
+
+test('server declares resources capability', () => {
+  assert(serverSource.includes('capabilities: { tools: {}, resources: {}, prompts: {} }'), 'server should declare resources capability');
+});
+
+test('server registers resource handlers', () => {
+  assert(serverSource.includes('ListResourcesRequestSchema'), 'should import list resources schema');
+  assert(serverSource.includes('ListResourceTemplatesRequestSchema'), 'should import list resource templates schema');
+  assert(serverSource.includes('ReadResourceRequestSchema'), 'should import read resource schema');
+  assert(serverSource.includes('server.setRequestHandler(ListResourcesRequestSchema'), 'should register resources/list handler');
+  assert(serverSource.includes('server.setRequestHandler(ReadResourceRequestSchema'), 'should register resources/read handler');
+});
+
+test('server exposes schema and session resources', () => {
+  assert(serverSource.includes('neon://schema/overview'), 'should expose schema overview resource');
+  assert(serverSource.includes('neon://session/latest-query'), 'should expose latest query resource');
+  assert(serverSource.includes('neon://session/latest-explain'), 'should expose latest explain resource');
+});
+
+test('server exposes table resource templates', () => {
+  assert(serverSource.includes('uriTemplate: "neon://table/{table}/schema"'), 'should expose table schema template');
+  assert(serverSource.includes('uriTemplate: "neon://table/{table}/sample"'), 'should expose table sample template');
+});
+
+// ── MCP prompts ──
+console.error('\n── MCP prompts ──');
+
+test('server declares prompts capability', () => {
+  assert(serverSource.includes('capabilities: { tools: {}, resources: {}, prompts: {} }'), 'server should declare prompts capability');
+});
+
+test('server imports and registers prompt handlers', () => {
+  assert(serverSource.includes('ListPromptsRequestSchema'), 'should import list prompts schema');
+  assert(serverSource.includes('GetPromptRequestSchema'), 'should import get prompt schema');
+  assert(serverSource.includes('server.setRequestHandler(ListPromptsRequestSchema'), 'should register prompts/list handler');
+  assert(serverSource.includes('server.setRequestHandler(GetPromptRequestSchema'), 'should register prompts/get handler');
+});
+
+test('server defines the five workflow prompts', () => {
+  assert(serverSource.includes('name: "understand_schema"'), 'should define understand_schema prompt');
+  assert(serverSource.includes('name: "investigate_product_surface"'), 'should define investigate_product_surface prompt');
+  assert(serverSource.includes('name: "explore_table"'), 'should define explore_table prompt');
+  assert(serverSource.includes('name: "investigate_query_error"'), 'should define investigate_query_error prompt');
+  assert(serverSource.includes('name: "trace_data_pipeline"'), 'should define trace_data_pipeline prompt');
+});
+
+test('prompt helper enforces required args', () => {
+  assert(serverSource.includes('function requirePromptArg(args, key)'), 'should define prompt arg helper');
+  assert(serverSource.includes('Prompt argument "${key}" is required'), 'should validate required prompt args');
 });
 
 // ── Summary ──
