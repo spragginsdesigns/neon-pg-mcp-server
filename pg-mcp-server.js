@@ -8,6 +8,8 @@ import {
   ReadResourceRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
+  CompleteRequestSchema,
+  SetLevelRequestSchema,
   ErrorCode,
   McpError
 } from "@modelcontextprotocol/sdk/types.js";
@@ -21,8 +23,42 @@ if (!CONNECTION_STRING) {
 const MAX_ROWS = 100;
 const QUERY_TIMEOUT = 30000;
 const RESOURCE_PAGE_SIZE = 100;
+const MAX_TOOL_RESPONSE_CHARS = 130000;
+const MAX_CELL_CHARS = 4000;
 const JSON_SCHEMA_URI = "https://json-schema.org/draft/2020-12/schema";
 const JSON_MIME_TYPE = "application/json";
+const SAFE_IDENTIFIER_PATTERN = "^[a-zA-Z_][a-zA-Z0-9_]*$";
+const LOG_LEVELS = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
+const SERVER_INSTRUCTIONS = [
+  "This server exposes a Neon Postgres database for live schema discovery and SQL work.",
+  "Use query for read-only SELECT, WITH, and EXPLAIN statements; it runs read-only and safely caps unbounded top-level result sets, so do not add LIMIT only to satisfy the server.",
+  "Use get_schema, search_schema, describe_table, and sample_data to verify table names, columns, JSONB keys, enums, and real row shapes before writing complex SQL.",
+  "Use execute only for intentional INSERT, UPDATE, DELETE, or DDL changes."
+].join(" ");
+
+const COMMON_SURFACES = [
+  "picks",
+  "sonar",
+  "games",
+  "users",
+  "players",
+  "videos",
+  "x_scraper",
+  "bot_analysis",
+  "vibe_bet_generator",
+  "referrals",
+  "subscriptions",
+  "odds"
+];
+
+const COMMON_PIPELINES = [
+  "vibe_reports_to_vibe_bets",
+  "x_tweets_to_bot_analysis",
+  "odds_feed_to_sonar",
+  "games_to_picks",
+  "users_to_referrals",
+  "videos_to_analysis"
+];
 
 const GENERIC_OBJECT_SCHEMA = {
   type: "object",
@@ -48,7 +84,14 @@ const QUERY_RESULT_SCHEMA = {
         required: ["name", "dataTypeID"]
       }
     },
-    warning: { type: "string" }
+    warning: { type: "string" },
+    payloadWarning: { type: "string" },
+    payloadTruncated: { type: "boolean" },
+    truncatedRows: { type: "integer" },
+    truncatedCells: { type: "integer" },
+    approxBytes: { type: "integer" },
+    defaultLimitApplied: { type: "boolean" },
+    maxRows: { type: "integer" }
   },
   required: ["rowCount", "rows", "fields"]
 };
@@ -149,7 +192,12 @@ const SAMPLE_DATA_RESULT_SCHEMA = {
     table: { type: "string" },
     rowCount: { type: "integer" },
     rows: { type: "array", items: GENERIC_OBJECT_SCHEMA },
-    jsonb_structures: GENERIC_OBJECT_SCHEMA
+    jsonb_structures: GENERIC_OBJECT_SCHEMA,
+    payloadWarning: { type: "string" },
+    payloadTruncated: { type: "boolean" },
+    truncatedRows: { type: "integer" },
+    truncatedCells: { type: "integer" },
+    approxBytes: { type: "integer" }
   },
   required: ["table", "rowCount", "rows"]
 };
@@ -254,6 +302,300 @@ function createJsonResource(uri, data) {
   };
 }
 
+function jsonSize(value) {
+  return JSON.stringify(value).length;
+}
+
+function truncateString(value, maxChars) {
+  if (value.length <= maxChars) return { value, truncated: false };
+  const omitted = value.length - maxChars;
+  return {
+    value: `${value.slice(0, maxChars)}... [truncated ${omitted} chars]`,
+    truncated: true
+  };
+}
+
+function budgetCellValue(value) {
+  if (typeof value === "string") {
+    return truncateString(value, MAX_CELL_CHARS);
+  }
+
+  if (value === null || typeof value !== "object") {
+    return { value, truncated: false };
+  }
+
+  const serialized = JSON.stringify(value);
+  if (serialized.length <= MAX_CELL_CHARS) {
+    return { value, truncated: false };
+  }
+
+  const preview = serialized.slice(0, MAX_CELL_CHARS);
+  return {
+    value: {
+      __truncated: true,
+      type: Array.isArray(value) ? "array" : "object",
+      originalBytes: serialized.length,
+      preview: `${preview}... [truncated ${serialized.length - MAX_CELL_CHARS} chars]`
+    },
+    truncated: true
+  };
+}
+
+function budgetRowsPayload(payload, rowKey = "rows") {
+  if (!Array.isArray(payload[rowKey]) || jsonSize(payload) <= MAX_TOOL_RESPONSE_CHARS) {
+    return payload;
+  }
+
+  let truncatedCells = 0;
+  let rows = payload[rowKey].map(row => {
+    if (!row || typeof row !== "object" || Array.isArray(row)) {
+      const budgeted = budgetCellValue(row);
+      if (budgeted.truncated) truncatedCells++;
+      return budgeted.value;
+    }
+
+    const nextRow = {};
+    for (const [key, value] of Object.entries(row)) {
+      const budgeted = budgetCellValue(value);
+      if (budgeted.truncated) truncatedCells++;
+      nextRow[key] = budgeted.value;
+    }
+    return nextRow;
+  });
+
+  let nextPayload = {
+    ...payload,
+    [rowKey]: rows,
+    payloadTruncated: true,
+    truncatedCells
+  };
+
+  if (jsonSize(nextPayload) > MAX_TOOL_RESPONSE_CHARS) {
+    const originalRows = rows.length;
+    let low = 0;
+    let high = rows.length;
+    let best = [];
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = {
+        ...nextPayload,
+        [rowKey]: rows.slice(0, mid),
+        truncatedRows: originalRows - mid
+      };
+
+      if (jsonSize(candidate) <= MAX_TOOL_RESPONSE_CHARS) {
+        best = candidate[rowKey];
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    nextPayload = {
+      ...nextPayload,
+      [rowKey]: best,
+      truncatedRows: originalRows - best.length
+    };
+  }
+
+  const rowMessage = nextPayload.truncatedRows > 0 ? ` and ${nextPayload.truncatedRows} rows` : "";
+  nextPayload.payloadWarning = `Tool result was reduced below ${MAX_TOOL_RESPONSE_CHARS} characters for Claude/Codex host limits; truncated ${truncatedCells} large cells${rowMessage}. Refine the query or select specific columns for full values.`;
+  nextPayload.approxBytes = jsonSize(nextPayload);
+  return nextPayload;
+}
+
+function maskSqlLiteralsAndComments(sql) {
+  let masked = "";
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+    const next = sql[i + 1];
+
+    const dollarQuote = sql.slice(i).match(/^\$[a-zA-Z_][a-zA-Z0-9_]*\$|^\$\$/);
+    if (dollarQuote) {
+      const tag = dollarQuote[0];
+      const end = sql.indexOf(tag, i + tag.length);
+      if (end !== -1) {
+        const length = end + tag.length - i;
+        masked += " ".repeat(length);
+        i += length;
+        continue;
+      }
+    }
+
+    if (ch === "'") {
+      masked += " ";
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === "'" && sql[i + 1] === "'") {
+          masked += "  ";
+          i += 2;
+          continue;
+        }
+        masked += sql[i] === "\n" ? "\n" : " ";
+        if (sql[i] === "'") {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      masked += " ";
+      i++;
+      while (i < sql.length) {
+        if (sql[i] === '"' && sql[i + 1] === '"') {
+          masked += "  ";
+          i += 2;
+          continue;
+        }
+        masked += sql[i] === "\n" ? "\n" : " ";
+        if (sql[i] === '"') {
+          i++;
+          break;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === "-" && next === "-") {
+      masked += "  ";
+      i += 2;
+      while (i < sql.length && sql[i] !== "\n") {
+        masked += " ";
+        i++;
+      }
+      continue;
+    }
+
+    if (ch === "/" && next === "*") {
+      let depth = 1;
+      masked += "  ";
+      i += 2;
+
+      while (i < sql.length && depth > 0) {
+        if (sql[i] === "/" && sql[i + 1] === "*") {
+          masked += "  ";
+          i += 2;
+          depth++;
+          continue;
+        }
+        if (sql[i] === "*" && sql[i + 1] === "/") {
+          masked += "  ";
+          i += 2;
+          depth--;
+          continue;
+        }
+        masked += sql[i] === "\n" ? "\n" : " ";
+        i++;
+      }
+      continue;
+    }
+
+    masked += ch;
+    i++;
+  }
+
+  return masked;
+}
+
+function isSqlWordAt(sql, index, word) {
+  const segment = sql.slice(index, index + word.length);
+  if (segment.toLowerCase() !== word) return false;
+
+  const before = index === 0 ? "" : sql[index - 1];
+  const after = sql[index + word.length] || "";
+  return !/[a-zA-Z0-9_$]/.test(before) && !/[a-zA-Z0-9_$]/.test(after);
+}
+
+function normalizeSingleSqlStatement(rawSql) {
+  const sql = rawSql.trim();
+  const masked = maskSqlLiteralsAndComments(sql);
+  const firstSemicolon = masked.indexOf(";");
+
+  if (firstSemicolon === -1) return sql;
+
+  const tail = masked.slice(firstSemicolon).replace(/;/g, "").trim();
+  if (tail.length > 0) {
+    throw new McpError(ErrorCode.InvalidParams, "Send one SELECT, WITH, or EXPLAIN statement at a time");
+  }
+
+  return sql.slice(0, firstSemicolon).trim();
+}
+
+function hasTopLevelResultLimit(sql) {
+  const masked = maskSqlLiteralsAndComments(sql);
+  let depth = 0;
+
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i];
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      continue;
+    }
+
+    if (depth !== 0) continue;
+
+    if (isSqlWordAt(masked, i, "limit")) return true;
+    if (isSqlWordAt(masked, i, "fetch") && /^fetch\s+(first|next)\b/i.test(masked.slice(i))) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function prepareReadOnlySql(rawSql) {
+  const sql = normalizeSingleSqlStatement(rawSql);
+  const lower = sql.toLowerCase();
+
+  if (!lower.startsWith('select') && !lower.startsWith('with') && !lower.startsWith('explain')) {
+    throw new McpError(ErrorCode.InvalidParams, "Use SELECT, WITH, or EXPLAIN queries only");
+  }
+
+  const isExplain = lower.startsWith('explain');
+  const hasUserLimit = isExplain || hasTopLevelResultLimit(sql);
+  const text = hasUserLimit ? sql : `SELECT * FROM (\n${sql}\n) AS mcp_limited_result LIMIT ${MAX_ROWS}`;
+
+  return {
+    sql,
+    text,
+    isExplain,
+    hasUserLimit,
+    defaultLimitApplied: !hasUserLimit
+  };
+}
+
+async function runReadOnlyQuery(text, params = []) {
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN READ ONLY');
+    await client.query(`SET LOCAL statement_timeout = ${QUERY_TIMEOUT}`);
+    const result = await client.query({ text, values: params });
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore rollback failures so the original query error is preserved.
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 // Helper: Get all table names (cached for error suggestions)
 let cachedTables = null;
 let cachedColumns = null;
@@ -269,6 +611,26 @@ let latestExplainResource = {
   status: "empty",
   message: "Run an EXPLAIN query with the query tool to populate this resource."
 };
+
+let minimumLogLevel = "warning";
+
+function shouldEmitLog(level) {
+  return LOG_LEVELS.indexOf(level) >= LOG_LEVELS.indexOf(minimumLogLevel);
+}
+
+async function sendServerLog(level, logger, data) {
+  if (!shouldEmitLog(level)) return;
+
+  try {
+    await server.sendLoggingMessage({ level, logger, data });
+  } catch {
+    // Logging is best-effort and must never break tool responses.
+  }
+}
+
+function recordDuration(startedAt) {
+  return Date.now() - startedAt;
+}
 
 function invalidateSchemaCache() {
   cachedTables = null;
@@ -351,20 +713,26 @@ function buildStaticResources() {
     {
       uri: "neon://schema/overview",
       name: "Schema Overview",
+      title: "Neon Schema Overview",
       description: "High-level snapshot of the current database schema.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.95 }
     },
     {
       uri: "neon://session/latest-query",
       name: "Latest Query Result",
+      title: "Latest Query Result",
       description: "Most recent result returned by the query tool in this MCP session.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.7 }
     },
     {
       uri: "neon://session/latest-explain",
       name: "Latest Query Plan",
+      title: "Latest Query Plan",
       description: "Most recent EXPLAIN result returned by the query tool in this MCP session.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.7 }
     }
   ];
 }
@@ -374,14 +742,18 @@ function buildTableResources(tables) {
     {
       uri: `neon://table/${encodeURIComponent(table)}/schema`,
       name: `${table} schema`,
+      title: `${table} Schema`,
       description: `Detailed schema for table "${table}".`,
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.85 }
     },
     {
       uri: `neon://table/${encodeURIComponent(table)}/sample`,
       name: `${table} sample`,
+      title: `${table} Sample Data`,
       description: `Sample rows and inferred JSON structure for table "${table}".`,
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.65 }
     }
   ]));
 }
@@ -582,20 +954,37 @@ const pool = new pg.Pool({
 
 const server = new Server(
   { name: "neon-pg", version: "1.7.0" },
-  { capabilities: { tools: {}, resources: {}, prompts: {} } }
+  {
+    capabilities: {
+      tools: {},
+      resources: {},
+      prompts: {},
+      logging: {},
+      completions: {}
+    },
+    instructions: SERVER_INSTRUCTIONS
+  }
 );
 
 // Tool definitions - 7 tools
 const TOOLS = [
   {
     name: "query",
-    description: "Execute a SQL SELECT query and return the results",
+    title: "Run Read-Only SQL",
+    description: `Run a read-only SQL SELECT, WITH, or EXPLAIN statement against Neon Postgres. Returns rows, field metadata, and whether the server applied its ${MAX_ROWS}-row safety cap.`,
+    annotations: {
+      title: "Run Read-Only SQL",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        sql: { type: "string", description: "SQL SELECT query to execute" },
+        sql: { type: "string", minLength: 1, description: "Read-only SQL SELECT, WITH, or EXPLAIN statement. A trailing semicolon is accepted; LIMIT is optional." },
         params: {
           type: "array",
           description: "Query parameters (optional)",
@@ -617,13 +1006,21 @@ const TOOLS = [
   },
   {
     name: "execute",
-    description: "Execute a SQL statement that modifies data (INSERT, UPDATE, DELETE)",
+    title: "Execute Write SQL",
+    description: "Run an intentional SQL mutation or DDL statement against Neon Postgres. Does not accept SELECT; use query for reads.",
+    annotations: {
+      title: "Execute Write SQL",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        sql: { type: "string", description: "SQL statement to execute" },
+        sql: { type: "string", minLength: 1, description: "SQL INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, TRUNCATE, or other non-SELECT statement to execute." },
         params: {
           type: "array",
           description: "Statement parameters (optional)",
@@ -645,7 +1042,15 @@ const TOOLS = [
   },
   {
     name: "get_tables",
-    description: "Get a list of tables in the database",
+    title: "List Tables",
+    description: "List public schema tables with approximate size and column counts.",
+    annotations: {
+      title: "List Tables",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
@@ -655,15 +1060,23 @@ const TOOLS = [
   },
   {
     name: "get_schema",
-    description: "Get database schema - tables, columns, types, keys, and JSON structures. By default excludes backup/archive tables and limits to 50 tables ordered by size. Use this FIRST to avoid column/table name errors.",
+    title: "Get Schema Overview",
+    description: "Return database schema overview: tables, columns, types, keys, and JSON structures. By default excludes backup/archive tables and returns up to 50 tables ordered by size.",
+    annotations: {
+      title: "Get Schema Overview",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        tables: { type: "array", items: { type: "string" }, description: "Specific tables to include (overrides limit/offset)" },
-        limit: { type: "number", description: "Max tables to return (default 50, max 200)" },
-        offset: { type: "number", description: "Skip first N tables for pagination (default 0)" },
+        tables: { type: "array", items: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN }, description: "Specific public table names to include; overrides limit and offset." },
+        limit: { type: "integer", minimum: 1, maximum: 200, default: 50, description: "Max tables to return. Default 50, hard cap 200." },
+        offset: { type: "integer", minimum: 0, default: 0, description: "Number of tables to skip for pagination. Default 0." },
         include_all: { type: "boolean", description: "Include backup/archive tables (default false)" }
       }
     },
@@ -671,13 +1084,21 @@ const TOOLS = [
   },
   {
     name: "describe_table",
-    description: "Get structure information about a specific table",
+    title: "Describe Table",
+    description: "Return detailed structure for one public table: columns, primary keys, foreign keys, indexes, enum values, JSONB keys, size, and row estimate.",
+    annotations: {
+      title: "Describe Table",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        table: { type: "string", description: "Name of the table to describe" }
+        table: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN, description: "Public table name to describe." }
       },
       required: ["table"]
     },
@@ -685,14 +1106,22 @@ const TOOLS = [
   },
   {
     name: "sample_data",
-    description: "Get sample rows from a table to see actual data format, JSON structures, and real values. Use the query tool for filtered results.",
+    title: "Sample Table Data",
+    description: "Return a few rows from one public table plus inferred JSON structures. For filtered samples, use query.",
+    annotations: {
+      title: "Sample Table Data",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        table: { type: "string", description: "Table name to sample from" },
-        limit: { type: "number", description: "Number of rows to return (default 3, max 10)" }
+        table: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN, description: "Public table name to sample from." },
+        limit: { type: "integer", minimum: 1, maximum: 10, default: 3, description: "Number of rows to return. Default 3, hard cap 10." }
       },
       required: ["table"]
     },
@@ -700,13 +1129,21 @@ const TOOLS = [
   },
   {
     name: "search_schema",
-    description: "Search for tables and columns by name pattern. Use when you know the concept but not exact name.",
+    title: "Search Schema",
+    description: "Search public table and column names by case-insensitive text pattern. Returns matching table names and table.column(type) matches.",
+    annotations: {
+      title: "Search Schema",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true
+    },
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
       additionalProperties: false,
       properties: {
-        pattern: { type: "string", description: "Search pattern (case-insensitive, searches table and column names)" }
+        pattern: { type: "string", minLength: 1, description: "Case-insensitive text to search for in public table and column names." }
       },
       required: ["pattern"]
     },
@@ -717,10 +1154,12 @@ const TOOLS = [
 const PROMPTS = [
   {
     name: "understand_schema",
+    title: "Understand Schema",
     description: "Understand the LineCrush database at a high level before writing queries."
   },
   {
     name: "investigate_product_surface",
+    title: "Investigate Product Surface",
     description: "Trace how a specific LineCrush product surface works in the database.",
     arguments: [
       {
@@ -732,6 +1171,7 @@ const PROMPTS = [
   },
   {
     name: "explore_table",
+    title: "Explore Table",
     description: "Deep-dive into a specific LineCrush table — structure, sample data, and relationships.",
     arguments: [
       {
@@ -743,6 +1183,7 @@ const PROMPTS = [
   },
   {
     name: "investigate_query_error",
+    title: "Investigate Query Error",
     description: "Debug a failing or unexpected SQL query against the LineCrush database.",
     arguments: [
       {
@@ -759,6 +1200,7 @@ const PROMPTS = [
   },
   {
     name: "trace_data_pipeline",
+    title: "Trace Data Pipeline",
     description: "Follow how data moves through a specific LineCrush ingestion or product pipeline.",
     arguments: [
       {
@@ -780,26 +1222,39 @@ server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({
     {
       uriTemplate: "neon://table/{table}/schema",
       name: "Table Schema",
+      title: "Table Schema",
       description: "Read the schema for a specific table.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.9 }
     },
     {
       uriTemplate: "neon://table/{table}/sample",
       name: "Table Sample Data",
+      title: "Table Sample Data",
       description: "Read sample rows and inferred JSON structure for a specific table.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.7 }
     },
     {
       uriTemplate: "neon://table/{table}/sample/{limit}",
       name: "Table Sample Data With Limit",
+      title: "Table Sample Data With Limit",
       description: "Read sample rows for a specific table with an explicit sample size.",
-      mimeType: JSON_MIME_TYPE
+      mimeType: JSON_MIME_TYPE,
+      annotations: { audience: ["assistant"], priority: 0.7 }
     }
   ]
 }));
 server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   return getPrompt(name, args);
+});
+server.setRequestHandler(SetLevelRequestSchema, async (request) => {
+  minimumLogLevel = request.params.level;
+  return {};
+});
+server.setRequestHandler(CompleteRequestSchema, async (request) => {
+  return await completeArgument(request.params);
 });
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const { uri } = request.params;
@@ -846,6 +1301,56 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   throw new McpError(ErrorCode.InvalidParams, `Unknown resource URI: ${uri}`);
 });
 
+async function completeArgument(params) {
+  const partial = String(params.argument?.value || "").toLowerCase();
+  const name = params.argument?.name;
+  const ref = params.ref || {};
+
+  if (name === "table" || name === "table_name") {
+    const { tables } = await getSchemaCache();
+    return createCompletionResult(filterCompletions(partial, tables));
+  }
+
+  if (ref.type === "ref/prompt" && name === "surface_name") {
+    return createCompletionResult(filterCompletions(partial, COMMON_SURFACES));
+  }
+
+  if (ref.type === "ref/prompt" && name === "pipeline_name") {
+    return createCompletionResult(filterCompletions(partial, COMMON_PIPELINES));
+  }
+
+  if (ref.type === "ref/resource" && name === "limit") {
+    return createCompletionResult(filterCompletions(partial, ["1", "3", "5", "10"]));
+  }
+
+  return createCompletionResult([]);
+}
+
+function filterCompletions(partial, candidates) {
+  return candidates
+    .map(value => {
+      const lower = value.toLowerCase();
+      let score = 2;
+      if (lower.startsWith(partial)) score = 0;
+      else if (lower.includes(partial)) score = 1;
+      return { value, score };
+    })
+    .filter(item => partial.length === 0 || item.score < 2)
+    .sort((a, b) => a.score - b.score || a.value.localeCompare(b.value))
+    .map(item => item.value);
+}
+
+function createCompletionResult(values) {
+  const limited = values.slice(0, 100);
+  return {
+    completion: {
+      values: limited,
+      total: values.length,
+      hasMore: values.length > limited.length
+    }
+  };
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
@@ -864,37 +1369,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function handleQuery(args) {
   if (!args.sql) throw new McpError(ErrorCode.InvalidParams, "sql required");
 
-  const lower = args.sql.trim().toLowerCase();
-  if (!lower.startsWith('select') && !lower.startsWith('with') && !lower.startsWith('explain')) {
-    throw new McpError(ErrorCode.InvalidParams, "Use SELECT, WITH, or EXPLAIN queries only");
-  }
-
-  const hasUserLimit = lower.startsWith('explain') || lower.includes(' limit ');
-  const sql = hasUserLimit ? args.sql : `${args.sql} LIMIT ${MAX_ROWS}`;
+  const prepared = prepareReadOnlySql(args.sql);
+  const startedAt = Date.now();
 
   try {
-    const result = await pool.query({ text: sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
+    const result = await runReadOnlyQuery(prepared.text, args.params || []);
 
-    const response = {
+    let response = {
       rowCount: result.rowCount,
       rows: result.rows,
-      fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID }))
+      fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID })),
+      defaultLimitApplied: prepared.defaultLimitApplied,
+      maxRows: MAX_ROWS
     };
 
-    if (!hasUserLimit && result.rowCount >= MAX_ROWS) {
-      response.warning = `Results truncated at ${MAX_ROWS} rows. Add an explicit LIMIT clause or use WHERE to narrow results.`;
+    if (prepared.defaultLimitApplied && result.rowCount >= MAX_ROWS) {
+      response.warning = `Results capped at ${MAX_ROWS} rows by the query tool. Add a top-level LIMIT or WHERE clause when you need a narrower result.`;
     }
 
+    response = budgetRowsPayload(response);
+
     updateLatestQueryResources({
-      sql: args.sql,
+      sql: prepared.sql,
       result: response,
-      isExplain: lower.startsWith('explain')
+      isExplain: prepared.isExplain
+    });
+
+    await sendServerLog("info", "query", {
+      durationMs: recordDuration(startedAt),
+      rowCount: response.rowCount,
+      returnedRows: response.rows.length,
+      defaultLimitApplied: response.defaultLimitApplied,
+      payloadTruncated: Boolean(response.payloadTruncated),
+      isExplain: prepared.isExplain
     });
 
     return createStructuredToolResult(response);
   } catch (error) {
-    const enhanced = await enhanceError(error, args.sql);
-    return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });
+    const enhanced = await enhanceError(error, prepared.sql);
+    await sendServerLog("error", "query", {
+      durationMs: recordDuration(startedAt),
+      isExplain: prepared.isExplain,
+      error: enhanced
+    });
+    return createToolErrorResult(enhanced, { error: enhanced, sql: prepared.sql });
   }
 }
 
@@ -905,6 +1423,8 @@ async function handleExecute(args) {
     throw new McpError(ErrorCode.InvalidParams, "Use query tool for SELECT");
   }
 
+  const startedAt = Date.now();
+
   try {
     const result = await pool.query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
 
@@ -914,12 +1434,23 @@ async function handleExecute(args) {
       invalidateSchemaCache();
     }
 
+    await sendServerLog("notice", "execute", {
+      durationMs: recordDuration(startedAt),
+      command: result.command,
+      rowCount: result.rowCount,
+      schemaCacheInvalidated: ['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME'].includes(firstWord)
+    });
+
     return createStructuredToolResult({
       command: result.command,
       rowCount: result.rowCount
     });
   } catch (error) {
     const enhanced = await enhanceError(error, args.sql);
+    await sendServerLog("error", "execute", {
+      durationMs: recordDuration(startedAt),
+      error: enhanced
+    });
     return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });
   }
 }
@@ -1195,7 +1726,7 @@ async function getSampleData(tableName, requestedLimit) {
       output.jsonb_structures = jsonbStructures;
     }
 
-    return output;
+    return budgetRowsPayload(output);
   } catch (error) {
     const enhanced = await enhanceError(error, `SELECT * FROM ${tableName}`);
     throw new McpError(ErrorCode.InvalidParams, enhanced);

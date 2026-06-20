@@ -40,11 +40,16 @@ The project provides multiple MCP server implementations demonstrating different
 
 ### MCP Tools Exposed
 
-All implementations expose 4 tools:
-- `query` - SELECT/WITH queries only (auto-limited to 100 rows)
+Production `pg-mcp-server.js` exposes 7 tools:
+- `query` - Read-only SELECT/WITH/EXPLAIN queries only (unbounded top-level results are capped at 100 rows)
 - `execute` - INSERT/UPDATE/DELETE statements
 - `get_tables` - List tables in public schema
+- `get_schema` - Schema overview with pagination and backup/archive filtering
 - `describe_table` - Table structure, columns, keys, indexes, enums, JSONB keys
+- `sample_data` - Small row samples with inferred JSONB structures
+- `search_schema` - Table and column name search
+
+Legacy examples (`index.js`, `basic-pg-server.js`, `src/index.ts`) expose the smaller 4-tool surface.
 
 ### Connection Architecture
 
@@ -58,8 +63,9 @@ Neon PostgreSQL Database
 
 ### Key Configuration
 
-- `MAX_ROWS`: 100 (auto-appended LIMIT for queries without one)
+- `MAX_ROWS`: 100 (server wraps unbounded top-level query results with an outer cap)
 - `QUERY_TIMEOUT`: 30000ms
+- `MAX_TOOL_RESPONSE_CHARS`: 130000 (query/sample payload budget for Claude/Codex host limits)
 - Pool: max 10 connections, 30s idle timeout, 10s connection timeout
 - SSL: `rejectUnauthorized: true` (required for Neon)
 
@@ -91,8 +97,9 @@ export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmo
 
 - Server uses stdio transport (stdin/stdout for MCP messages, stderr for logs)
 - Handles SIGINT/SIGTERM for graceful pool shutdown
-- Query tool validates SQL starts with SELECT/WITH
+- Query tool validates SQL starts with SELECT/WITH/EXPLAIN, accepts trailing semicolons, and runs read-only
 - Execute tool rejects SELECT (enforces tool separation)
+- Tool metadata includes titles, read/write annotations, structured outputs, server instructions, completions, and structured logging
 
 ---
 
