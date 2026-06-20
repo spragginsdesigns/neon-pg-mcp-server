@@ -308,8 +308,8 @@ test('server handles logging level and completion requests', () => {
 
 test('all tools include annotations and titles', () => {
   const toolDefs = serverSource.match(/name:\s*"[^"]+"[\s\S]*?outputSchema:/g) || [];
-  assert(toolDefs.length >= 7, 'should find tool definitions');
-  for (const toolDef of toolDefs.slice(0, 7)) {
+  assert(toolDefs.length >= 8, 'should find tool definitions');
+  for (const toolDef of toolDefs.slice(0, 8)) {
     assert(toolDef.includes('title:'), 'tool should include title');
     assert(toolDef.includes('annotations:'), 'tool should include annotations');
     assert(toolDef.includes('readOnlyHint:'), 'tool should include readOnlyHint');
@@ -317,11 +317,19 @@ test('all tools include annotations and titles', () => {
   }
 });
 
+test('server exposes list_slow_queries as a read-only performance tool', () => {
+  assert(serverSource.includes('name: "list_slow_queries"'), 'should define list_slow_queries tool');
+  assert(serverSource.includes('outputSchema: SLOW_QUERIES_RESULT_SCHEMA'), 'slow query tool should expose output schema');
+  assert(serverSource.includes('case "list_slow_queries": return await handleListSlowQueries(args);'), 'should route slow query tool calls');
+  assert(serverSource.includes("SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'"), 'should check pg_stat_statements availability');
+});
+
 test('query and sample data are protected by payload budgeting', () => {
   assert(serverSource.includes('MAX_TOOL_RESPONSE_CHARS'), 'should define host payload budget');
   assert(serverSource.includes('function budgetRowsPayload'), 'should define row payload budget helper');
   assert(serverSource.includes('response = budgetRowsPayload(response);'), 'query should budget payloads');
   assert(serverSource.includes('return budgetRowsPayload(output);'), 'sample_data should budget payloads');
+  assert(serverSource.includes('response = budgetRowsPayload(response, "slowQueries");'), 'list_slow_queries should budget payloads');
 });
 
 // ── Summary ──
