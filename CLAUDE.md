@@ -40,9 +40,10 @@ The project provides multiple MCP server implementations demonstrating different
 
 ### MCP Tools Exposed
 
-Production `pg-mcp-server.js` exposes 7 tools:
+Production `pg-mcp-server.js` exposes 8 tools:
 - `query` - Read-only SELECT/WITH/EXPLAIN queries only (unbounded top-level results are capped at 100 rows)
 - `execute` - INSERT/UPDATE/DELETE statements
+- `list_slow_queries` - Read-only `pg_stat_statements` performance hotspots
 - `get_tables` - List tables in public schema
 - `get_schema` - Schema overview with pagination and backup/archive filtering
 - `describe_table` - Table structure, columns, keys, indexes, enums, JSONB keys
@@ -66,6 +67,7 @@ Neon PostgreSQL Database
 - `MAX_ROWS`: 100 (server wraps unbounded top-level query results with an outer cap)
 - `QUERY_TIMEOUT`: 30000ms
 - `MAX_TOOL_RESPONSE_CHARS`: 130000 (query/sample payload budget for Claude/Codex host limits)
+- `list_slow_queries`: requires `pg_stat_statements`; returns a setup note if the extension is absent
 - Pool: max 10 connections, 30s idle timeout, 10s connection timeout
 - SSL: `rejectUnauthorized: true` (required for Neon)
 

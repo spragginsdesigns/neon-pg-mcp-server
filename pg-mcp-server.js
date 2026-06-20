@@ -32,6 +32,7 @@ const LOG_LEVELS = ["debug", "info", "notice", "warning", "error", "critical", "
 const SERVER_INSTRUCTIONS = [
   "This server exposes a Neon Postgres database for live schema discovery and SQL work.",
   "Use query for read-only SELECT, WITH, and EXPLAIN statements; it runs read-only and safely caps unbounded top-level result sets, so do not add LIMIT only to satisfy the server.",
+  "Use list_slow_queries to find pg_stat_statements performance hotspots before tuning SQL.",
   "Use get_schema, search_schema, describe_table, and sample_data to verify table names, columns, JSONB keys, enums, and real row shapes before writing complex SQL.",
   "Use execute only for intentional INSERT, UPDATE, DELETE, or DDL changes."
 ].join(" ");
@@ -212,6 +213,50 @@ const SEARCH_SCHEMA_RESULT_SCHEMA = {
     matching_columns: { type: "array", items: { type: "string" } }
   },
   required: ["pattern", "matching_tables", "matching_columns"]
+};
+
+const SQL_STAT_NUMBER_SCHEMA = { type: ["number", "string", "null"] };
+
+const SLOW_QUERIES_RESULT_SCHEMA = {
+  $schema: JSON_SCHEMA_URI,
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    extensionInstalled: { type: "boolean" },
+    slowQueries: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          queryId: { type: ["string", "null"] },
+          query: { type: "string" },
+          calls: SQL_STAT_NUMBER_SCHEMA,
+          totalExecTimeMs: SQL_STAT_NUMBER_SCHEMA,
+          meanExecTimeMs: SQL_STAT_NUMBER_SCHEMA,
+          minExecTimeMs: SQL_STAT_NUMBER_SCHEMA,
+          maxExecTimeMs: SQL_STAT_NUMBER_SCHEMA,
+          rows: SQL_STAT_NUMBER_SCHEMA,
+          sharedBlocks: GENERIC_OBJECT_SCHEMA,
+          tempBlocks: GENERIC_OBJECT_SCHEMA,
+          wal: GENERIC_OBJECT_SCHEMA
+        },
+        required: ["query", "calls", "totalExecTimeMs", "meanExecTimeMs", "rows"]
+      }
+    },
+    totalQueriesFound: { type: "integer" },
+    limit: { type: "integer" },
+    orderBy: { type: "string" },
+    minMeanMs: { type: "number" },
+    note: { type: "string" },
+    installSql: { type: "string" },
+    payloadWarning: { type: "string" },
+    payloadTruncated: { type: "boolean" },
+    truncatedRows: { type: "integer" },
+    truncatedCells: { type: "integer" },
+    approxBytes: { type: "integer" }
+  },
+  required: ["extensionInstalled", "slowQueries", "totalQueriesFound", "limit", "orderBy", "minMeanMs"]
 };
 
 // Helper: Calculate Levenshtein distance for fuzzy matching
@@ -966,7 +1011,7 @@ const server = new Server(
   }
 );
 
-// Tool definitions - 7 tools
+// Tool definitions - 8 tools
 const TOOLS = [
   {
     name: "query",
@@ -1003,6 +1048,34 @@ const TOOLS = [
       required: ["sql"]
     },
     outputSchema: QUERY_RESULT_SCHEMA
+  },
+  {
+    name: "list_slow_queries",
+    title: "List Slow Queries",
+    description: "List the slowest statements tracked by pg_stat_statements. Use this before tuning SQL or adding indexes. Returns a clear setup note when the extension is not installed.",
+    annotations: {
+      title: "List Slow Queries",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true
+    },
+    inputSchema: {
+      $schema: JSON_SCHEMA_URI,
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        limit: { type: "integer", minimum: 1, maximum: 25, default: 10, description: "Maximum slow queries to return. Default 10, hard cap 25." },
+        order_by: {
+          type: "string",
+          enum: ["mean_exec_time", "total_exec_time", "calls", "rows"],
+          default: "mean_exec_time",
+          description: "Metric to sort by descending. Default mean_exec_time."
+        },
+        min_mean_ms: { type: "number", minimum: 0, default: 0, description: "Only include statements with mean execution time at or above this many milliseconds." }
+      }
+    },
+    outputSchema: SLOW_QUERIES_RESULT_SCHEMA
   },
   {
     name: "execute",
@@ -1356,6 +1429,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (name) {
     case "query": return await handleQuery(args);
+    case "list_slow_queries": return await handleListSlowQueries(args);
     case "execute": return await handleExecute(args);
     case "get_tables": return await handleGetTables();
     case "get_schema": return await handleGetSchema(args);
@@ -1414,6 +1488,144 @@ async function handleQuery(args) {
     });
     return createToolErrorResult(enhanced, { error: enhanced, sql: prepared.sql });
   }
+}
+
+const SLOW_QUERY_ORDER_BY = Object.freeze({
+  mean_exec_time: "mean_exec_time",
+  total_exec_time: "total_exec_time",
+  calls: "calls",
+  rows: "rows"
+});
+
+function normalizeSlowQueryArgs(args = {}) {
+  const limit = Math.min(Math.max(1, Math.trunc(Number(args.limit ?? 10))), 25);
+  const minMeanMs = Number(args.min_mean_ms ?? 0);
+  const orderBy = args.order_by ?? "mean_exec_time";
+
+  if (!Number.isFinite(limit)) {
+    throw new McpError(ErrorCode.InvalidParams, "limit must be a number between 1 and 25");
+  }
+  if (!Number.isFinite(minMeanMs) || minMeanMs < 0) {
+    throw new McpError(ErrorCode.InvalidParams, "min_mean_ms must be a non-negative number");
+  }
+  if (!Object.hasOwn(SLOW_QUERY_ORDER_BY, orderBy)) {
+    throw new McpError(ErrorCode.InvalidParams, "order_by must be one of mean_exec_time, total_exec_time, calls, rows");
+  }
+
+  return { limit, minMeanMs, orderBy, orderBySql: SLOW_QUERY_ORDER_BY[orderBy] };
+}
+
+function truncateSqlText(sql, maxLength = MAX_CELL_CHARS) {
+  if (typeof sql !== "string" || sql.length <= maxLength) return sql;
+  return `${sql.slice(0, maxLength)}... [truncated ${sql.length - maxLength} chars]`;
+}
+
+async function handleListSlowQueries(args) {
+  const startedAt = Date.now();
+
+  try {
+    let response = await getSlowQueries(args);
+    response = budgetRowsPayload(response, "slowQueries");
+
+    await sendServerLog("info", "list_slow_queries", {
+      durationMs: recordDuration(startedAt),
+      extensionInstalled: response.extensionInstalled,
+      totalQueriesFound: response.totalQueriesFound,
+      payloadTruncated: Boolean(response.payloadTruncated)
+    });
+
+    return createStructuredToolResult(response);
+  } catch (error) {
+    const message = error.message || "Failed to list slow queries";
+    await sendServerLog("error", "list_slow_queries", {
+      durationMs: recordDuration(startedAt),
+      error: message
+    });
+    return createToolErrorResult(message, { error: message });
+  }
+}
+
+async function getSlowQueries(args) {
+  const { limit, minMeanMs, orderBy, orderBySql } = normalizeSlowQueryArgs(args);
+
+  const extensionCheck = await runReadOnlyQuery(`
+    SELECT EXISTS (
+      SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
+    ) AS extension_installed
+  `);
+
+  if (!extensionCheck.rows[0]?.extension_installed) {
+    return {
+      extensionInstalled: false,
+      slowQueries: [],
+      totalQueriesFound: 0,
+      limit,
+      orderBy,
+      minMeanMs,
+      note: "pg_stat_statements is not installed in this database, so slow-query history is unavailable.",
+      installSql: "CREATE EXTENSION IF NOT EXISTS pg_stat_statements;"
+    };
+  }
+
+  const result = await runReadOnlyQuery(`
+    SELECT
+      queryid::text AS query_id,
+      query,
+      calls,
+      total_exec_time,
+      mean_exec_time,
+      min_exec_time,
+      max_exec_time,
+      rows,
+      shared_blks_hit,
+      shared_blks_read,
+      shared_blks_written,
+      shared_blks_dirtied,
+      temp_blks_read,
+      temp_blks_written,
+      wal_records,
+      wal_fpi,
+      wal_bytes
+    FROM pg_stat_statements
+    WHERE query NOT ILIKE '%pg_stat_statements%'
+      AND query NOT ILIKE 'EXPLAIN%'
+      AND mean_exec_time >= $1
+    ORDER BY ${orderBySql} DESC
+    LIMIT $2
+  `, [minMeanMs, limit]);
+
+  return {
+    extensionInstalled: true,
+    slowQueries: result.rows.map(row => ({
+      queryId: row.query_id,
+      query: truncateSqlText(row.query),
+      calls: row.calls,
+      totalExecTimeMs: row.total_exec_time,
+      meanExecTimeMs: row.mean_exec_time,
+      minExecTimeMs: row.min_exec_time,
+      maxExecTimeMs: row.max_exec_time,
+      rows: row.rows,
+      sharedBlocks: {
+        hit: row.shared_blks_hit,
+        read: row.shared_blks_read,
+        written: row.shared_blks_written,
+        dirtied: row.shared_blks_dirtied
+      },
+      tempBlocks: {
+        read: row.temp_blks_read,
+        written: row.temp_blks_written
+      },
+      wal: {
+        records: row.wal_records,
+        fullPageImages: row.wal_fpi,
+        bytes: row.wal_bytes
+      }
+    })),
+    totalQueriesFound: result.rowCount,
+    limit,
+    orderBy,
+    minMeanMs
+  };
 }
 
 async function handleExecute(args) {

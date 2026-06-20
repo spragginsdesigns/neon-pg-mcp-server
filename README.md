@@ -103,7 +103,7 @@ node build/index.js
 
 ## Available Tools
 
-Production `pg-mcp-server.js` exposes 7 tools. Each tool includes Claude/Codex-friendly titles, read/write annotations, structured output schemas, and JSON text fallbacks.
+Production `pg-mcp-server.js` exposes 8 tools. Each tool includes Claude/Codex-friendly titles, read/write annotations, structured output schemas, and JSON text fallbacks.
 
 ### 1. Query Tool
 Execute read-only SELECT, WITH, and EXPLAIN queries to retrieve data from your database.
@@ -131,12 +131,22 @@ Execute SQL statements that modify data (INSERT, UPDATE, DELETE).
 INSERT INTO users (name, email) VALUES ($1, $2)
 ```
 
-### 3. Get Tables Tool
+### 3. List Slow Queries Tool
+List the slowest statements tracked by `pg_stat_statements`.
+
+**Parameters:**
+- `limit` (optional): Max queries to return, default 10, hard cap 25
+- `order_by` (optional): Sort metric, one of `mean_exec_time`, `total_exec_time`, `calls`, or `rows`
+- `min_mean_ms` (optional): Minimum mean execution time in milliseconds
+
+If `pg_stat_statements` is not installed, the tool returns a structured setup note instead of a cryptic database error.
+
+### 4. Get Tables Tool
 List public schema tables with approximate size and column counts.
 
 **Parameters:** None
 
-### 4. Get Schema Tool
+### 5. Get Schema Tool
 Return schema overview: table names, sizes, row estimates, column counts, and pagination metadata.
 
 **Parameters:**
@@ -145,7 +155,7 @@ Return schema overview: table names, sizes, row estimates, column counts, and pa
 - `offset` (optional): Tables to skip for pagination
 - `include_all` (optional): Include backup/archive tables
 
-### 5. Describe Table Tool
+### 6. Describe Table Tool
 Get detailed structure information about a specific public table.
 
 **Parameters:**
@@ -155,14 +165,14 @@ Get detailed structure information about a specific public table.
 - Column information (name, data type, nullable, default value)
 - Primary key columns, foreign keys, indexes, enum values, JSONB keys, size, row estimate
 
-### 6. Sample Data Tool
+### 7. Sample Data Tool
 Return a few rows from a public table plus inferred JSONB structure.
 
 **Parameters:**
 - `table` (required): Name of the table to sample
 - `limit` (optional): Number of rows, default 3, hard cap 10
 
-### 7. Search Schema Tool
+### 8. Search Schema Tool
 Search public table and column names by case-insensitive text pattern.
 
 **Parameters:**
@@ -174,7 +184,8 @@ Search public table and column names by case-insensitive text pattern.
 - **Tool annotations** mark read-only vs write tools for safer host permissions and confirmations.
 - **Completions** provide suggestions for table names, prompt arguments, resource template arguments, and sample limits.
 - **Structured logging** supports client-controlled log levels without writing protocol-breaking output to stdout.
-- **Payload budgeting** trims oversized query/sample results below host limits before Claude receives them.
+- **Payload budgeting** trims oversized query, sample, and slow-query results below host limits before Claude receives them.
+- **Slow-query discovery** gives agents a safe `pg_stat_statements` entry point before they start tuning queries.
 
 ## Security Considerations
 
