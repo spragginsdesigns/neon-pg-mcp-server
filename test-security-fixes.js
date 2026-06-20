@@ -121,20 +121,42 @@ test('allows EXPLAIN queries', () => {
   assert(serverSource.includes("!lower.startsWith('explain')"), 'should check for explain');
 });
 
-// ── LIMIT truncation warning ──
-console.error('\n── LIMIT truncation warning ──');
+// ── LIMIT handling ──
+console.error('\n── LIMIT handling ──');
 
 test('extracts hasUserLimit boolean', () => {
   assert(serverSource.includes('const hasUserLimit'), 'should have hasUserLimit');
 });
 
-test('adds warning when truncated', () => {
-  assert(serverSource.includes('response.warning'), 'should set warning');
-  assert(serverSource.includes('Results truncated at'), 'should have truncation message');
+test('wraps default-limited queries instead of appending LIMIT', () => {
+  assert(serverSource.includes('function prepareReadOnlySql(rawSql)'), 'should prepare read-only SQL');
+  assert(serverSource.includes('AS mcp_limited_result LIMIT ${MAX_ROWS}'), 'should wrap unbounded queries with an outer limit');
 });
 
-test('warning only triggers without user LIMIT', () => {
-  assert(serverSource.includes('!hasUserLimit && result.rowCount >= MAX_ROWS'), 'should check both conditions');
+test('normalizes trailing semicolons before applying the default limit', () => {
+  assert(serverSource.includes('function normalizeSingleSqlStatement(rawSql)'), 'should normalize SQL statements');
+  assert(serverSource.includes('return sql.slice(0, firstSemicolon).trim();'), 'should remove trailing semicolon');
+});
+
+test('detects top-level LIMIT/FETCH clauses', () => {
+  assert(serverSource.includes('function hasTopLevelResultLimit(sql)'), 'should detect top-level limits');
+  assert(serverSource.includes('isSqlWordAt(masked, i, "limit")'), 'should detect LIMIT as a SQL word');
+  assert(serverSource.includes('fetch\\s+(first|next)'), 'should detect FETCH FIRST/NEXT');
+});
+
+test('runs query tool statements in a read-only transaction', () => {
+  assert(serverSource.includes('async function runReadOnlyQuery(text, params = [])'), 'should use read-only query helper');
+  assert(serverSource.includes("client.query('BEGIN READ ONLY')"), 'should begin read-only transaction');
+  assert(serverSource.includes('SET LOCAL statement_timeout'), 'should set statement timeout in transaction');
+});
+
+test('adds warning when capped', () => {
+  assert(serverSource.includes('response.warning'), 'should set warning');
+  assert(serverSource.includes('Results capped at'), 'should have cap warning message');
+});
+
+test('warning only triggers when the default limit is applied', () => {
+  assert(serverSource.includes('prepared.defaultLimitApplied && result.rowCount >= MAX_ROWS'), 'should check both conditions');
 });
 
 // ── sample_data cleanup ──
@@ -149,7 +171,7 @@ test('sample_data tool definition has no where property', () => {
 });
 
 test('sample_data description mentions query tool for filtering', () => {
-  assert(serverSource.includes('Use the query tool for filtered results'), 'should direct to query tool');
+  assert(serverSource.includes('For filtered samples, use query'), 'should direct to query tool');
 });
 
 test('handleSampleData has no whereClause', () => {
@@ -160,22 +182,24 @@ test('handleSampleData has no whereClause', () => {
 });
 
 test('sample_data validates table identifier', () => {
-  const handleMatch = serverSource.match(/async function handleSampleData[\s\S]*?^}/m);
-  assert(handleMatch[0].includes("assertSafeIdentifier(args.table, 'table name')"), 'should validate table name');
+  const helperMatch = serverSource.match(/async function getSampleData[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getSampleData');
+  assert(helperMatch[0].includes("assertSafeIdentifier(tableName, 'table name')"), 'should validate table name');
 });
 
 // ── describe_table security ──
 console.error('\n── describe_table security ──');
 
 test('describe_table validates table identifier', () => {
-  const handleMatch = serverSource.match(/async function handleDescribeTable[\s\S]*?^}/m);
-  assert(handleMatch, 'should find handleDescribeTable');
-  assert(handleMatch[0].includes("assertSafeIdentifier(args.table, 'table name')"), 'should validate table name');
+  const helperMatch = serverSource.match(/async function getTableDescription[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getTableDescription');
+  assert(helperMatch[0].includes("assertSafeIdentifier(tableName, 'table name')"), 'should validate table name');
 });
 
 test('JSONB loop validates column identifier', () => {
-  const handleMatch = serverSource.match(/async function handleDescribeTable[\s\S]*?^}/m);
-  assert(handleMatch[0].includes("assertSafeIdentifier(jcol.col, 'column name')"), 'should validate column name in JSONB loop');
+  const helperMatch = serverSource.match(/async function getTableDescription[\s\S]*?^}/m);
+  assert(helperMatch, 'should find getTableDescription');
+  assert(helperMatch[0].includes("assertSafeIdentifier(jcol.col, 'column name')"), 'should validate column name in JSONB loop');
 });
 
 // ── Version ──
@@ -187,6 +211,117 @@ test('server version is 1.7.0', () => {
 
 test('startup log is v1.7.0', () => {
   assert(serverSource.includes('neon-pg MCP v1.7.0'), 'startup log should be v1.7.0');
+});
+
+// ── Structured MCP outputs ──
+console.error('\n── structuredContent & outputSchema ──');
+
+test('tool definitions include output schemas', () => {
+  assert(serverSource.includes('outputSchema: QUERY_RESULT_SCHEMA'), 'query should expose outputSchema');
+  assert(serverSource.includes('outputSchema: EXECUTE_RESULT_SCHEMA'), 'execute should expose outputSchema');
+  assert(serverSource.includes('outputSchema: SCHEMA_OVERVIEW_RESULT_SCHEMA'), 'get_schema should expose outputSchema');
+});
+
+test('server source returns structuredContent from tools', () => {
+  assert(serverSource.includes('structuredContent: data'), 'should include structuredContent helper');
+  assert(serverSource.includes('return createStructuredToolResult(response);'), 'query should return structured results');
+  assert(serverSource.includes('return createStructuredToolResult(await getTablesSummary());'), 'get_tables should return structured results');
+});
+
+test('tool errors can include structured content', () => {
+  assert(serverSource.includes('result.structuredContent = structuredContent'), 'error helper should include structured content');
+  assert(serverSource.includes('return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });'), 'tool errors should return structured details');
+});
+
+// ── MCP resources ──
+console.error('\n── MCP resources ──');
+
+test('server declares resources capability', () => {
+  assert(serverSource.includes('resources: {}'), 'server should declare resources capability');
+});
+
+test('server registers resource handlers', () => {
+  assert(serverSource.includes('ListResourcesRequestSchema'), 'should import list resources schema');
+  assert(serverSource.includes('ListResourceTemplatesRequestSchema'), 'should import list resource templates schema');
+  assert(serverSource.includes('ReadResourceRequestSchema'), 'should import read resource schema');
+  assert(serverSource.includes('server.setRequestHandler(ListResourcesRequestSchema'), 'should register resources/list handler');
+  assert(serverSource.includes('server.setRequestHandler(ReadResourceRequestSchema'), 'should register resources/read handler');
+});
+
+test('server exposes schema and session resources', () => {
+  assert(serverSource.includes('neon://schema/overview'), 'should expose schema overview resource');
+  assert(serverSource.includes('neon://session/latest-query'), 'should expose latest query resource');
+  assert(serverSource.includes('neon://session/latest-explain'), 'should expose latest explain resource');
+});
+
+test('server exposes table resource templates', () => {
+  assert(serverSource.includes('uriTemplate: "neon://table/{table}/schema"'), 'should expose table schema template');
+  assert(serverSource.includes('uriTemplate: "neon://table/{table}/sample"'), 'should expose table sample template');
+});
+
+// ── MCP prompts ──
+console.error('\n── MCP prompts ──');
+
+test('server declares prompts capability', () => {
+  assert(serverSource.includes('prompts: {}'), 'server should declare prompts capability');
+});
+
+test('server imports and registers prompt handlers', () => {
+  assert(serverSource.includes('ListPromptsRequestSchema'), 'should import list prompts schema');
+  assert(serverSource.includes('GetPromptRequestSchema'), 'should import get prompt schema');
+  assert(serverSource.includes('server.setRequestHandler(ListPromptsRequestSchema'), 'should register prompts/list handler');
+  assert(serverSource.includes('server.setRequestHandler(GetPromptRequestSchema'), 'should register prompts/get handler');
+});
+
+test('server defines the five workflow prompts', () => {
+  assert(serverSource.includes('name: "understand_schema"'), 'should define understand_schema prompt');
+  assert(serverSource.includes('name: "investigate_product_surface"'), 'should define investigate_product_surface prompt');
+  assert(serverSource.includes('name: "explore_table"'), 'should define explore_table prompt');
+  assert(serverSource.includes('name: "investigate_query_error"'), 'should define investigate_query_error prompt');
+  assert(serverSource.includes('name: "trace_data_pipeline"'), 'should define trace_data_pipeline prompt');
+});
+
+test('prompt helper enforces required args', () => {
+  assert(serverSource.includes('function requirePromptArg(args, key)'), 'should define prompt arg helper');
+  assert(serverSource.includes('Prompt argument "${key}" is required'), 'should validate required prompt args');
+});
+
+// ── Claude/Codex agent ergonomics ──
+console.error('\n── Claude/Codex ergonomics ──');
+
+test('server exposes instructions', () => {
+  assert(serverSource.includes('const SERVER_INSTRUCTIONS'), 'should define server instructions');
+  assert(serverSource.includes('instructions: SERVER_INSTRUCTIONS'), 'should pass instructions to Server');
+});
+
+test('server declares logging and completion capabilities', () => {
+  assert(serverSource.includes('logging: {}'), 'should declare logging capability');
+  assert(serverSource.includes('completions: {}'), 'should declare completions capability');
+});
+
+test('server handles logging level and completion requests', () => {
+  assert(serverSource.includes('SetLevelRequestSchema'), 'should import/set logging level handler');
+  assert(serverSource.includes('CompleteRequestSchema'), 'should import completion handler');
+  assert(serverSource.includes('server.setRequestHandler(SetLevelRequestSchema'), 'should register logging level handler');
+  assert(serverSource.includes('server.setRequestHandler(CompleteRequestSchema'), 'should register completion handler');
+});
+
+test('all tools include annotations and titles', () => {
+  const toolDefs = serverSource.match(/name:\s*"[^"]+"[\s\S]*?outputSchema:/g) || [];
+  assert(toolDefs.length >= 7, 'should find tool definitions');
+  for (const toolDef of toolDefs.slice(0, 7)) {
+    assert(toolDef.includes('title:'), 'tool should include title');
+    assert(toolDef.includes('annotations:'), 'tool should include annotations');
+    assert(toolDef.includes('readOnlyHint:'), 'tool should include readOnlyHint');
+    assert(toolDef.includes('destructiveHint:'), 'tool should include destructiveHint');
+  }
+});
+
+test('query and sample data are protected by payload budgeting', () => {
+  assert(serverSource.includes('MAX_TOOL_RESPONSE_CHARS'), 'should define host payload budget');
+  assert(serverSource.includes('function budgetRowsPayload'), 'should define row payload budget helper');
+  assert(serverSource.includes('response = budgetRowsPayload(response);'), 'query should budget payloads');
+  assert(serverSource.includes('return budgetRowsPayload(output);'), 'sample_data should budget payloads');
 });
 
 // ── Summary ──

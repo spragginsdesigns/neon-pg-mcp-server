@@ -103,11 +103,15 @@ node build/index.js
 
 ## Available Tools
 
+Production `pg-mcp-server.js` exposes 7 tools. Each tool includes Claude/Codex-friendly titles, read/write annotations, structured output schemas, and JSON text fallbacks.
+
 ### 1. Query Tool
-Execute SELECT queries to retrieve data from your database.
+Execute read-only SELECT, WITH, and EXPLAIN queries to retrieve data from your database.
+
+The query tool runs inside a read-only transaction and safely caps unbounded top-level result sets at 100 rows, so agents can omit `LIMIT` during exploration. A trailing semicolon is accepted.
 
 **Parameters:**
-- `sql` (required): SQL SELECT query to execute
+- `sql` (required): SQL SELECT, WITH, or EXPLAIN statement to execute
 - `params` (optional): Array of query parameters for parameterized queries
 
 **Example:**
@@ -128,29 +132,60 @@ INSERT INTO users (name, email) VALUES ($1, $2)
 ```
 
 ### 3. Get Tables Tool
-List all tables in the public schema of your database.
+List public schema tables with approximate size and column counts.
 
 **Parameters:** None
 
-**Returns:** Array of table names
+### 4. Get Schema Tool
+Return schema overview: table names, sizes, row estimates, column counts, and pagination metadata.
 
-### 4. Describe Table Tool
-Get detailed structure information about a specific table.
+**Parameters:**
+- `tables` (optional): Specific public tables to include
+- `limit` (optional): Max tables to return, default 50, hard cap 200
+- `offset` (optional): Tables to skip for pagination
+- `include_all` (optional): Include backup/archive tables
+
+### 5. Describe Table Tool
+Get detailed structure information about a specific public table.
 
 **Parameters:**
 - `table` (required): Name of the table to describe
 
 **Returns:** 
 - Column information (name, data type, nullable, default value)
-- Primary key columns
+- Primary key columns, foreign keys, indexes, enum values, JSONB keys, size, row estimate
+
+### 6. Sample Data Tool
+Return a few rows from a public table plus inferred JSONB structure.
+
+**Parameters:**
+- `table` (required): Name of the table to sample
+- `limit` (optional): Number of rows, default 3, hard cap 10
+
+### 7. Search Schema Tool
+Search public table and column names by case-insensitive text pattern.
+
+**Parameters:**
+- `pattern` (required): Text to search for in table and column names
+
+## Agent Ergonomics
+
+- **Server instructions** tell Claude/Codex how to use schema discovery tools and avoid unnecessary LIMIT retries.
+- **Tool annotations** mark read-only vs write tools for safer host permissions and confirmations.
+- **Completions** provide suggestions for table names, prompt arguments, resource template arguments, and sample limits.
+- **Structured logging** supports client-controlled log levels without writing protocol-breaking output to stdout.
+- **Payload budgeting** trims oversized query/sample results below host limits before Claude receives them.
 
 ## Security Considerations
 
 - **Connection String**: Store your connection string as an environment variable, never commit it to version control
 - **SSL/TLS**: The server enforces SSL connections to Neon PostgreSQL
 - **Query Validation**: The server validates that:
-  - Query tool only accepts SELECT and WITH statements
+  - Query tool only accepts SELECT, WITH, and EXPLAIN statements
+  - Query tool runs inside a read-only transaction
+  - Unbounded top-level query results are capped at 100 rows without requiring agents to write `LIMIT`
   - Execute tool rejects SELECT statements (use Query tool instead)
+- **Payload Control**: Query and sample results are reduced below host payload limits by truncating large cells, then rows as a last resort
 - **Parameterized Queries**: Use parameterized queries to prevent SQL injection
 
 ## Configuration
