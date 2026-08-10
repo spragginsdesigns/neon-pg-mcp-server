@@ -78,39 +78,53 @@ function projectNames() {
   return [...CONNECTIONS.keys()];
 }
 
-function describeConnection(name) {
+// Per-project metadata, parsed once at startup. `source` is the block stamped
+// on every tool result; it never contains credentials.
+const PROJECT_INFO = new Map([...CONNECTIONS.entries()].map(([name, connectionString]) => {
+  let host = null;
+  let database = null;
   try {
-    const url = new URL(CONNECTIONS.get(name));
-    return {
-      host: url.hostname,
-      database: decodeURIComponent(url.pathname.replace(/^\//, '')) || null
-    };
+    const url = new URL(connectionString);
+    host = url.hostname;
+    database = decodeURIComponent(url.pathname.replace(/^\//, '')) || null;
   } catch {
-    return { host: null, database: null };
+    // Unparseable connection string; source falls back to nulls.
   }
-}
+  const readonly = READONLY_PROJECTS.has(name);
+  const source = { project: name, database, host };
+  if (readonly) source.readonly = true;
+  return [name, {
+    name,
+    host,
+    database,
+    default: name === DEFAULT_PROJECT,
+    readonly,
+    source: Object.freeze(source)
+  }];
+}));
 
 function projectSource(project) {
-  const { host, database } = describeConnection(project);
-  const source = { project, database, host };
-  if (READONLY_PROJECTS.has(project)) source.readonly = true;
-  return source;
+  return PROJECT_INFO.get(project).source;
 }
 
-function resolveProject(args, { requireExplicit = false, toolName = 'this tool' } = {}) {
+function configuredProjectsHint() {
+  return `Configured projects: ${projectNames().join(', ')}`;
+}
+
+function resolveProject(args, { forWrite = false, toolName = 'this tool' } = {}) {
   const requested = args?.project;
 
   if (requested === undefined || requested === null || requested === '') {
-    if (requireExplicit) {
+    if (forWrite) {
       throw new McpError(
         ErrorCode.InvalidParams,
-        `${toolName} requires an explicit "project" argument so writes can never land on an unintended database. Nothing was executed. Configured projects: ${projectNames().join(', ')}`
+        `${toolName} requires an explicit "project" argument so writes can never land on an unintended database. Nothing was executed. ${configuredProjectsHint()}`
       );
     }
     if (!DEFAULT_PROJECT) {
       throw new McpError(
         ErrorCode.InvalidParams,
-        `No default project is configured; pass "project". Configured projects: ${projectNames().join(', ')}`
+        `No default project is configured; pass "project". ${configuredProjectsHint()}`
       );
     }
     return DEFAULT_PROJECT;
@@ -121,7 +135,14 @@ function resolveProject(args, { requireExplicit = false, toolName = 'this tool' 
     const hint = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(', ')}?` : '';
     throw new McpError(
       ErrorCode.InvalidParams,
-      `Unknown project "${requested}". Configured projects: ${projectNames().join(', ')}.${hint}`
+      `Unknown project "${requested}". ${configuredProjectsHint()}.${hint}`
+    );
+  }
+
+  if (forWrite && READONLY_PROJECTS.has(requested)) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Project "${requested}" (database ${PROJECT_INFO.get(requested).database ?? 'unknown'}) is listed in NEON_PG_READONLY_PROJECTS; ${toolName} is refused and nothing was run. Use the query tool for reads.`
     );
   }
 
@@ -483,7 +504,7 @@ function createStructuredToolResult(data, extras = {}) {
   };
 }
 
-function createToolErrorResult(message, structuredContent, source) {
+function createToolErrorResult(message, source, structuredContent) {
   const prefix = source ? `[project=${source.project} database=${source.database ?? "unknown"}] ` : "";
   const result = {
     content: [{
@@ -493,11 +514,9 @@ function createToolErrorResult(message, structuredContent, source) {
     isError: true
   };
 
-  const structured = { ...(structuredContent ?? {}) };
+  const structured = { error: message, ...(structuredContent ?? {}) };
   if (source) structured.source = source;
-  if (Object.keys(structured).length > 0) {
-    result.structuredContent = structured;
-  }
+  result.structuredContent = structured;
 
   return result;
 }
@@ -851,14 +870,16 @@ async function getSchemaCache(project) {
   }
 
   const pool = getPool(project);
-  const tablesResult = await pool.query(`
-    SELECT table_name FROM information_schema.tables
-    WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-  `);
-  const columnsResult = await pool.query(`
-    SELECT table_name, column_name FROM information_schema.columns
-    WHERE table_schema = 'public'
-  `);
+  const [tablesResult, columnsResult] = await Promise.all([
+    pool.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    `),
+    pool.query(`
+      SELECT table_name, column_name FROM information_schema.columns
+      WHERE table_schema = 'public'
+    `)
+  ]);
 
   const next = {
     tables: tablesResult.rows.map(r => r.table_name),
@@ -1192,7 +1213,7 @@ function requireDefaultProject() {
   if (!DEFAULT_PROJECT) {
     throw new McpError(
       ErrorCode.InvalidParams,
-      `Resources are served from the default project, but none is configured. Configured projects: ${projectNames().join(', ')}`
+      `Resources are served from the default project, but none is configured. ${configuredProjectsHint()}`
     );
   }
   return DEFAULT_PROJECT;
@@ -1676,16 +1697,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 function handleListProjects() {
-  const projects = projectNames().map(name => {
-    const { host, database } = describeConnection(name);
-    return {
-      name,
-      host,
-      database,
-      default: name === DEFAULT_PROJECT,
-      readonly: READONLY_PROJECTS.has(name)
-    };
-  });
+  const projects = [...PROJECT_INFO.values()].map(({ name, host, database, default: isDefault, readonly }) => (
+    { name, host, database, default: isDefault, readonly }
+  ));
 
   return createStructuredToolResult({
     projects,
@@ -1699,14 +1713,14 @@ async function handleQuery(args) {
   const source = projectSource(project);
 
   if (!args.sql) {
-    return createToolErrorResult("sql required", { error: "sql required" }, source);
+    return createToolErrorResult("sql required", source);
   }
 
   let prepared;
   try {
     prepared = prepareReadOnlySql(args.sql);
   } catch (error) {
-    return createToolErrorResult(error.message, { error: error.message }, source);
+    return createToolErrorResult(error.message, source);
   }
 
   const startedAt = Date.now();
@@ -1755,7 +1769,7 @@ async function handleQuery(args) {
       isExplain: prepared.isExplain,
       error: enhanced
     });
-    return createToolErrorResult(enhanced, { error: enhanced, sql: prepared.sql }, source);
+    return createToolErrorResult(enhanced, source, { sql: prepared.sql });
   }
 }
 
@@ -1814,7 +1828,7 @@ async function handleListSlowQueries(args) {
       durationMs: recordDuration(startedAt),
       error: message
     });
-    return createToolErrorResult(message, { error: message }, source);
+    return createToolErrorResult(message, source);
   }
 }
 
@@ -1902,22 +1916,17 @@ async function getSlowQueries(args, project) {
 }
 
 async function handleExecute(args) {
-  // Writes never fall back to a default connection: an explicit project is mandatory.
-  const project = resolveProject(args, { requireExplicit: true, toolName: "execute" });
+  // forWrite enforces the whole write-safety policy in resolveProject:
+  // explicit project required (no default), readonly projects refused.
+  const project = resolveProject(args, { forWrite: true, toolName: "execute" });
   const source = projectSource(project);
 
-  if (READONLY_PROJECTS.has(project)) {
-    const message = `Project "${project}" is listed in NEON_PG_READONLY_PROJECTS; execute is refused and nothing was run. Use the query tool for reads.`;
-    await sendServerLog("warning", "execute", { project, refused: "readonly" });
-    return createToolErrorResult(message, { error: message }, source);
-  }
-
   if (!args.sql) {
-    return createToolErrorResult("sql required", { error: "sql required" }, source);
+    return createToolErrorResult("sql required", source);
   }
 
   if (args.sql.trim().toLowerCase().startsWith('select')) {
-    return createToolErrorResult("Use query tool for SELECT", { error: "Use query tool for SELECT" }, source);
+    return createToolErrorResult("Use query tool for SELECT", source);
   }
 
   const startedAt = Date.now();
@@ -1951,7 +1960,7 @@ async function handleExecute(args) {
       durationMs: recordDuration(startedAt),
       error: enhanced
     });
-    return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql }, source);
+    return createToolErrorResult(enhanced, source, { sql: args.sql });
   }
 }
 
@@ -1965,8 +1974,7 @@ async function runReadToolWithSource(args, toolName, fn) {
   try {
     return createStructuredToolResult({ source, ...(await fn(project)) });
   } catch (error) {
-    const message = error?.message || String(error);
-    return createToolErrorResult(message, { error: message }, source);
+    return createToolErrorResult(error?.message || String(error), source);
   }
 }
 
@@ -2305,11 +2313,9 @@ async function searchSchema(rawPattern, project) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`neon-pg MCP v1.8.0 — projects: ${projectNames().map(name => {
-  const { host, database } = describeConnection(name);
-  const markers = `${name === DEFAULT_PROJECT ? '*' : ''}${READONLY_PROJECTS.has(name) ? ' [readonly]' : ''}`;
-  return `${name}${markers} (${database ?? '?'} @ ${host ?? '?'})`;
-}).join(', ')}`);
+console.error(`neon-pg MCP v1.8.0 — projects: ${[...PROJECT_INFO.values()].map(p =>
+  `${p.name}${p.default ? '*' : ''}${p.readonly ? ' [readonly]' : ''} (${p.database ?? '?'} @ ${p.host ?? '?'})`
+).join(', ')}`);
 
 async function closePools() {
   await Promise.all([...pools.values()].map(pool => pool.end().catch(() => {})));

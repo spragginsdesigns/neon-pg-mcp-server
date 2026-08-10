@@ -228,7 +228,7 @@ test('server source returns structuredContent from tools', () => {
 
 test('tool errors can include structured content', () => {
   assert(serverSource.includes('result.structuredContent = structured'), 'error helper should include structured content');
-  assert(serverSource.includes('return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql }, source);'), 'tool errors should return structured details with their source');
+  assert(serverSource.includes('return createToolErrorResult(enhanced, source, { sql: args.sql });'), 'tool errors should return structured details with their source');
 });
 
 // ── MCP resources ──
