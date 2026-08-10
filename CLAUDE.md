@@ -40,9 +40,10 @@ The project provides multiple MCP server implementations demonstrating different
 
 ### MCP Tools Exposed
 
-Production `pg-mcp-server.js` exposes 8 tools:
+Production `pg-mcp-server.js` exposes 9 tools:
+- `list_projects` - Configured project connections (name, host, database, default/readonly flags; never credentials)
 - `query` - Read-only SELECT/WITH/EXPLAIN queries only (unbounded top-level results are capped at 100 rows)
-- `execute` - INSERT/UPDATE/DELETE statements
+- `execute` - INSERT/UPDATE/DELETE statements; REQUIRES an explicit `project` argument and refuses projects in `NEON_PG_READONLY_PROJECTS`
 - `list_slow_queries` - Read-only `pg_stat_statements` performance hotspots
 - `get_tables` - List tables in public schema
 - `get_schema` - Schema overview with pagination and backup/archive filtering
@@ -51,6 +52,8 @@ Production `pg-mcp-server.js` exposes 8 tools:
 - `search_schema` - Table and column name search
 
 Legacy examples (`index.js`, `basic-pg-server.js`, `src/index.ts`) expose the smaller 4-tool surface.
+
+All tools except `list_projects` take an optional `project` argument selecting a named connection (default: the `default` project); every result and error carries a `source` block naming the project, database, and host it ran against.
 
 ### Connection Architecture
 
@@ -73,10 +76,16 @@ Neon PostgreSQL Database
 
 ## Environment
 
-**Required:** `NEON_PG_CONNECTION_STRING` - Neon PostgreSQL connection string with SSL
+At least one of the first two is required:
+
+- `NEON_PG_CONNECTION_STRING` - Single Neon connection string with SSL, registered as project `default` (legacy setup, still supported)
+- `NEON_PG_CONNECTIONS` - JSON map of project name -> connection string for multi-project setups
+- `NEON_PG_READONLY_PROJECTS` - Optional comma-separated project names where `execute` is refused
 
 ```bash
 export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmode=require"
+export NEON_PG_CONNECTIONS='{"versemind":"postgresql://...","linecrush":"postgresql://..."}'
+export NEON_PG_READONLY_PROJECTS="linecrush"
 ```
 
 ## MCP Integration
@@ -145,6 +154,7 @@ git commit -m "type(scope): msg"  # Conventional commit
 
 ### Testing Changes
 
-1. Set `NEON_PG_CONNECTION_STRING` environment variable
-2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.3.0" to stderr
+1. Set `NEON_PG_CONNECTION_STRING` (and/or `NEON_PG_CONNECTIONS`) environment variable
+2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.8.0" plus the configured project list to stderr
 3. Test with MCP client or send JSON-RPC via stdin
+4. Run `node test-security-fixes.js` for the source-level regression suite

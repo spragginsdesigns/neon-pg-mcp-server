@@ -15,9 +15,117 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import pg from 'pg';
 
-const CONNECTION_STRING = process.env.NEON_PG_CONNECTION_STRING;
-if (!CONNECTION_STRING) {
-  throw new Error('NEON_PG_CONNECTION_STRING environment variable is required');
+const PROJECT_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+
+function loadConnections() {
+  const connections = new Map();
+
+  const single = process.env.NEON_PG_CONNECTION_STRING;
+  if (single) {
+    connections.set('default', single);
+  }
+
+  const multiRaw = process.env.NEON_PG_CONNECTIONS;
+  if (multiRaw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(multiRaw);
+    } catch (error) {
+      throw new Error(`NEON_PG_CONNECTIONS must be valid JSON mapping project names to connection strings: ${error.message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('NEON_PG_CONNECTIONS must be a JSON object mapping project names to connection strings');
+    }
+    for (const [name, connectionString] of Object.entries(parsed)) {
+      if (!PROJECT_NAME_PATTERN.test(name)) {
+        throw new Error(`NEON_PG_CONNECTIONS project name "${name}" is invalid; use letters, digits, "_", "-", or "."`);
+      }
+      if (typeof connectionString !== 'string' || connectionString.length === 0) {
+        throw new Error(`NEON_PG_CONNECTIONS entry "${name}" must be a non-empty connection string`);
+      }
+      if (name === 'default' && connections.has('default')) {
+        console.error('neon-pg: NEON_PG_CONNECTIONS "default" overrides NEON_PG_CONNECTION_STRING');
+      }
+      connections.set(name, connectionString);
+    }
+  }
+
+  if (connections.size === 0) {
+    throw new Error('Set NEON_PG_CONNECTION_STRING (single database) or NEON_PG_CONNECTIONS (JSON map of project name -> connection string)');
+  }
+
+  return connections;
+}
+
+const CONNECTIONS = loadConnections();
+const DEFAULT_PROJECT = CONNECTIONS.has('default')
+  ? 'default'
+  : (CONNECTIONS.size === 1 ? [...CONNECTIONS.keys()][0] : null);
+
+const READONLY_PROJECTS = new Set(
+  (process.env.NEON_PG_READONLY_PROJECTS || '')
+    .split(',')
+    .map(name => name.trim())
+    .filter(Boolean)
+);
+for (const name of READONLY_PROJECTS) {
+  if (!CONNECTIONS.has(name)) {
+    console.error(`neon-pg: NEON_PG_READONLY_PROJECTS names unknown project "${name}"`);
+  }
+}
+
+function projectNames() {
+  return [...CONNECTIONS.keys()];
+}
+
+function describeConnection(name) {
+  try {
+    const url = new URL(CONNECTIONS.get(name));
+    return {
+      host: url.hostname,
+      database: decodeURIComponent(url.pathname.replace(/^\//, '')) || null
+    };
+  } catch {
+    return { host: null, database: null };
+  }
+}
+
+function projectSource(project) {
+  const { host, database } = describeConnection(project);
+  const source = { project, database, host };
+  if (READONLY_PROJECTS.has(project)) source.readonly = true;
+  return source;
+}
+
+function resolveProject(args, { requireExplicit = false, toolName = 'this tool' } = {}) {
+  const requested = args?.project;
+
+  if (requested === undefined || requested === null || requested === '') {
+    if (requireExplicit) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `${toolName} requires an explicit "project" argument so writes can never land on an unintended database. Nothing was executed. Configured projects: ${projectNames().join(', ')}`
+      );
+    }
+    if (!DEFAULT_PROJECT) {
+      throw new McpError(
+        ErrorCode.InvalidParams,
+        `No default project is configured; pass "project". Configured projects: ${projectNames().join(', ')}`
+      );
+    }
+    return DEFAULT_PROJECT;
+  }
+
+  if (typeof requested !== 'string' || !CONNECTIONS.has(requested)) {
+    const suggestions = typeof requested === 'string' ? findSimilar(requested, projectNames()) : [];
+    const hint = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(', ')}?` : '';
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Unknown project "${requested}". Configured projects: ${projectNames().join(', ')}.${hint}`
+    );
+  }
+
+  return requested;
 }
 
 const MAX_ROWS = 100;
@@ -30,11 +138,13 @@ const JSON_MIME_TYPE = "application/json";
 const SAFE_IDENTIFIER_PATTERN = "^[a-zA-Z_][a-zA-Z0-9_]*$";
 const LOG_LEVELS = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
 const SERVER_INSTRUCTIONS = [
-  "This server exposes a Neon Postgres database for live schema discovery and SQL work.",
+  "This server exposes one or more named Neon Postgres projects for live schema discovery and SQL work.",
+  "Call list_projects to see the configured projects; pass the optional project argument on any tool to target a specific one.",
+  "Every tool result carries a source block naming the project, database, and host it ran against — always check it before trusting or acting on results.",
   "Use query for read-only SELECT, WITH, and EXPLAIN statements; it runs read-only and safely caps unbounded top-level result sets, so do not add LIMIT only to satisfy the server.",
   "Use list_slow_queries to find pg_stat_statements performance hotspots before tuning SQL.",
   "Use get_schema, search_schema, describe_table, and sample_data to verify table names, columns, JSONB keys, enums, and real row shapes before writing complex SQL.",
-  "Use execute only for intentional INSERT, UPDATE, DELETE, or DDL changes."
+  "Use execute only for intentional INSERT, UPDATE, DELETE, or DDL changes; execute always requires an explicit project argument and refuses projects marked read-only."
 ].join(" ");
 
 const COMMON_SURFACES = [
@@ -66,11 +176,56 @@ const GENERIC_OBJECT_SCHEMA = {
   additionalProperties: true
 };
 
+const SOURCE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  description: "Which configured project, database, and host this result ran against.",
+  properties: {
+    project: { type: "string" },
+    database: { type: ["string", "null"] },
+    host: { type: ["string", "null"] },
+    readonly: { type: "boolean" }
+  },
+  required: ["project", "database", "host"]
+};
+
+const PROJECT_ARG_SCHEMA = {
+  type: "string",
+  description: "Named project connection to run against (see list_projects). Defaults to the \"default\" project."
+};
+
+const LIST_PROJECTS_RESULT_SCHEMA = {
+  $schema: JSON_SCHEMA_URI,
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    projects: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          name: { type: "string" },
+          host: { type: ["string", "null"] },
+          database: { type: ["string", "null"] },
+          default: { type: "boolean" },
+          readonly: { type: "boolean" }
+        },
+        required: ["name", "host", "database", "default", "readonly"]
+      }
+    },
+    defaultProject: { type: ["string", "null"] },
+    note: { type: "string" }
+  },
+  required: ["projects", "defaultProject"]
+};
+
 const QUERY_RESULT_SCHEMA = {
   $schema: JSON_SCHEMA_URI,
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     rowCount: { type: "integer" },
     rows: { type: "array", items: GENERIC_OBJECT_SCHEMA },
     fields: {
@@ -94,7 +249,7 @@ const QUERY_RESULT_SCHEMA = {
     defaultLimitApplied: { type: "boolean" },
     maxRows: { type: "integer" }
   },
-  required: ["rowCount", "rows", "fields"]
+  required: ["source", "rowCount", "rows", "fields"]
 };
 
 const EXECUTE_RESULT_SCHEMA = {
@@ -102,10 +257,11 @@ const EXECUTE_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     command: { type: "string" },
     rowCount: { type: "integer" }
   },
-  required: ["command", "rowCount"]
+  required: ["source", "command", "rowCount"]
 };
 
 const TABLES_RESULT_SCHEMA = {
@@ -113,6 +269,7 @@ const TABLES_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     tables: {
       type: "array",
       items: {
@@ -127,7 +284,7 @@ const TABLES_RESULT_SCHEMA = {
       }
     }
   },
-  required: ["tables"]
+  required: ["source", "tables"]
 };
 
 const SCHEMA_OVERVIEW_RESULT_SCHEMA = {
@@ -135,6 +292,7 @@ const SCHEMA_OVERVIEW_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     tables: {
       type: "array",
       items: {
@@ -164,7 +322,7 @@ const SCHEMA_OVERVIEW_RESULT_SCHEMA = {
     },
     note: { type: "string" }
   },
-  required: ["tables", "pagination"]
+  required: ["source", "tables", "pagination"]
 };
 
 const TABLE_SCHEMA_RESULT_SCHEMA = {
@@ -172,6 +330,7 @@ const TABLE_SCHEMA_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     table: { type: "string" },
     columns: { type: "array", items: GENERIC_OBJECT_SCHEMA },
     primaryKeys: { type: "array", items: { type: "string" } },
@@ -182,7 +341,7 @@ const TABLE_SCHEMA_RESULT_SCHEMA = {
     enums: GENERIC_OBJECT_SCHEMA,
     jsonbKeys: GENERIC_OBJECT_SCHEMA
   },
-  required: ["table", "columns", "primaryKeys", "size", "rowEstimate"]
+  required: ["source", "table", "columns", "primaryKeys", "size", "rowEstimate"]
 };
 
 const SAMPLE_DATA_RESULT_SCHEMA = {
@@ -190,6 +349,7 @@ const SAMPLE_DATA_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     table: { type: "string" },
     rowCount: { type: "integer" },
     rows: { type: "array", items: GENERIC_OBJECT_SCHEMA },
@@ -200,7 +360,7 @@ const SAMPLE_DATA_RESULT_SCHEMA = {
     truncatedCells: { type: "integer" },
     approxBytes: { type: "integer" }
   },
-  required: ["table", "rowCount", "rows"]
+  required: ["source", "table", "rowCount", "rows"]
 };
 
 const SEARCH_SCHEMA_RESULT_SCHEMA = {
@@ -208,11 +368,12 @@ const SEARCH_SCHEMA_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     pattern: { type: "string" },
     matching_tables: { type: "array", items: { type: "string" } },
     matching_columns: { type: "array", items: { type: "string" } }
   },
-  required: ["pattern", "matching_tables", "matching_columns"]
+  required: ["source", "pattern", "matching_tables", "matching_columns"]
 };
 
 const SQL_STAT_NUMBER_SCHEMA = { type: ["number", "string", "null"] };
@@ -222,6 +383,7 @@ const SLOW_QUERIES_RESULT_SCHEMA = {
   type: "object",
   additionalProperties: false,
   properties: {
+    source: SOURCE_SCHEMA,
     extensionInstalled: { type: "boolean" },
     slowQueries: {
       type: "array",
@@ -256,7 +418,7 @@ const SLOW_QUERIES_RESULT_SCHEMA = {
     truncatedCells: { type: "integer" },
     approxBytes: { type: "integer" }
   },
-  required: ["extensionInstalled", "slowQueries", "totalQueriesFound", "limit", "orderBy", "minMeanMs"]
+  required: ["source", "extensionInstalled", "slowQueries", "totalQueriesFound", "limit", "orderBy", "minMeanMs"]
 };
 
 // Helper: Calculate Levenshtein distance for fuzzy matching
@@ -321,17 +483,20 @@ function createStructuredToolResult(data, extras = {}) {
   };
 }
 
-function createToolErrorResult(message, structuredContent) {
+function createToolErrorResult(message, structuredContent, source) {
+  const prefix = source ? `[project=${source.project} database=${source.database ?? "unknown"}] ` : "";
   const result = {
     content: [{
       type: "text",
-      text: message
+      text: `${prefix}${message}`
     }],
     isError: true
   };
 
-  if (structuredContent !== undefined) {
-    result.structuredContent = structuredContent;
+  const structured = { ...(structuredContent ?? {}) };
+  if (source) structured.source = source;
+  if (Object.keys(structured).length > 0) {
+    result.structuredContent = structured;
   }
 
   return result;
@@ -620,8 +785,8 @@ function prepareReadOnlySql(rawSql) {
   };
 }
 
-async function runReadOnlyQuery(text, params = []) {
-  const client = await pool.connect();
+async function runReadOnlyQuery(project, text, params = []) {
+  const client = await getPool(project).connect();
 
   try {
     await client.query('BEGIN READ ONLY');
@@ -641,10 +806,8 @@ async function runReadOnlyQuery(text, params = []) {
   }
 }
 
-// Helper: Get all table names (cached for error suggestions)
-let cachedTables = null;
-let cachedColumns = null;
-let cacheTimestamp = 0;
+// Helper: Get all table names per project (cached for error suggestions)
+const schemaCaches = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 let latestQueryResource = {
@@ -677,34 +840,47 @@ function recordDuration(startedAt) {
   return Date.now() - startedAt;
 }
 
-function invalidateSchemaCache() {
-  cachedTables = null;
-  cachedColumns = null;
-  cacheTimestamp = 0;
+function invalidateSchemaCache(project) {
+  schemaCaches.delete(project);
 }
 
-async function getSchemaCache() {
-  if (!cachedTables || Date.now() - cacheTimestamp > CACHE_TTL) {
-    const tablesResult = await pool.query(`
-      SELECT table_name FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
-    `);
-    cachedTables = tablesResult.rows.map(r => r.table_name);
-
-    const columnsResult = await pool.query(`
-      SELECT table_name, column_name FROM information_schema.columns
-      WHERE table_schema = 'public'
-    `);
-    cachedColumns = columnsResult.rows;
-    cacheTimestamp = Date.now();
+async function getSchemaCache(project) {
+  const cached = schemaCaches.get(project);
+  if (cached && Date.now() - cached.timestamp <= CACHE_TTL) {
+    return cached;
   }
-  return { tables: cachedTables, columns: cachedColumns };
+
+  const pool = getPool(project);
+  const tablesResult = await pool.query(`
+    SELECT table_name FROM information_schema.tables
+    WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+  `);
+  const columnsResult = await pool.query(`
+    SELECT table_name, column_name FROM information_schema.columns
+    WHERE table_schema = 'public'
+  `);
+
+  const next = {
+    tables: tablesResult.rows.map(r => r.table_name),
+    columns: columnsResult.rows,
+    timestamp: Date.now()
+  };
+  schemaCaches.set(project, next);
+  return next;
 }
 
 // Helper: Parse PostgreSQL error and add suggestions
-async function enhanceError(error, sql) {
+async function enhanceError(project, error, sql) {
   const msg = error.message || '';
-  const { tables, columns } = await getSchemaCache();
+
+  let tables;
+  let columns;
+  try {
+    ({ tables, columns } = await getSchemaCache(project));
+  } catch {
+    // Schema lookup failed (e.g. connection is down); fall back to the raw error.
+    return msg;
+  }
 
   // Column not found
   let match = msg.match(/column "([^"]+)" does not exist/i);
@@ -739,8 +915,9 @@ async function enhanceError(error, sql) {
   return msg;
 }
 
-function updateLatestQueryResources({ sql, result, isExplain }) {
+function updateLatestQueryResources({ project, sql, result, isExplain }) {
   const snapshot = {
+    project,
     sql,
     capturedAt: new Date().toISOString(),
     result
@@ -805,8 +982,12 @@ function buildTableResources(tables) {
 
 async function listResources(cursor) {
   const offset = decodeCursor(cursor);
-  const { tables } = await getSchemaCache();
-  const resources = [...buildStaticResources(), ...buildTableResources(tables)];
+  let tableResources = [];
+  if (DEFAULT_PROJECT) {
+    const { tables } = await getSchemaCache(DEFAULT_PROJECT);
+    tableResources = buildTableResources(tables);
+  }
+  const resources = [...buildStaticResources(), ...tableResources];
   const page = resources.slice(offset, offset + RESOURCE_PAGE_SIZE);
   const nextOffset = offset + page.length;
 
@@ -989,16 +1170,36 @@ function extractJsonStructure(obj, maxDepth = 5, currentDepth = 0) {
   return typeof obj;
 }
 
-const pool = new pg.Pool({
-  connectionString: CONNECTION_STRING,
-  ssl: { rejectUnauthorized: true },
-  max: 10,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 10000
-});
+// Lazy per-project pools, created on first use and cached.
+const pools = new Map();
+
+function getPool(project) {
+  let pool = pools.get(project);
+  if (!pool) {
+    pool = new pg.Pool({
+      connectionString: CONNECTIONS.get(project),
+      ssl: { rejectUnauthorized: true },
+      max: 10,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 10000
+    });
+    pools.set(project, pool);
+  }
+  return pool;
+}
+
+function requireDefaultProject() {
+  if (!DEFAULT_PROJECT) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Resources are served from the default project, but none is configured. Configured projects: ${projectNames().join(', ')}`
+    );
+  }
+  return DEFAULT_PROJECT;
+}
 
 const server = new Server(
-  { name: "neon-pg", version: "1.7.0" },
+  { name: "neon-pg", version: "1.8.0" },
   {
     capabilities: {
       tools: {},
@@ -1011,8 +1212,26 @@ const server = new Server(
   }
 );
 
-// Tool definitions - 8 tools
+// Tool definitions - 9 tools
 const TOOLS = [
+  {
+    name: "list_projects",
+    title: "List Configured Projects",
+    description: "List the named Neon project connections this server is configured with, including host, database, default flag, and read-only flag. Never returns credentials.",
+    annotations: {
+      title: "List Configured Projects",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false
+    },
+    inputSchema: {
+      $schema: JSON_SCHEMA_URI,
+      type: "object",
+      additionalProperties: false
+    },
+    outputSchema: LIST_PROJECTS_RESULT_SCHEMA
+  },
   {
     name: "query",
     title: "Run Read-Only SQL",
@@ -1029,6 +1248,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         sql: { type: "string", minLength: 1, description: "Read-only SQL SELECT, WITH, or EXPLAIN statement. A trailing semicolon is accepted; LIMIT is optional." },
         params: {
           type: "array",
@@ -1065,6 +1285,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         limit: { type: "integer", minimum: 1, maximum: 25, default: 10, description: "Maximum slow queries to return. Default 10, hard cap 25." },
         order_by: {
           type: "string",
@@ -1080,7 +1301,7 @@ const TOOLS = [
   {
     name: "execute",
     title: "Execute Write SQL",
-    description: "Run an intentional SQL mutation or DDL statement against Neon Postgres. Does not accept SELECT; use query for reads.",
+    description: "Run an intentional SQL mutation or DDL statement against Neon Postgres. REQUIRES an explicit project argument naming the target database (no default is applied); refuses projects listed in NEON_PG_READONLY_PROJECTS. Does not accept SELECT; use query for reads.",
     annotations: {
       title: "Execute Write SQL",
       readOnlyHint: false,
@@ -1093,6 +1314,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: { type: "string", description: "REQUIRED. Named project connection to write to (see list_projects). No default is applied for writes." },
         sql: { type: "string", minLength: 1, description: "SQL INSERT, UPDATE, DELETE, CREATE, ALTER, DROP, TRUNCATE, or other non-SELECT statement to execute." },
         params: {
           type: "array",
@@ -1109,7 +1331,7 @@ const TOOLS = [
           }
         }
       },
-      required: ["sql"]
+      required: ["sql", "project"]
     },
     outputSchema: EXECUTE_RESULT_SCHEMA
   },
@@ -1127,7 +1349,10 @@ const TOOLS = [
     inputSchema: {
       $schema: JSON_SCHEMA_URI,
       type: "object",
-      additionalProperties: false
+      additionalProperties: false,
+      properties: {
+        project: PROJECT_ARG_SCHEMA
+      }
     },
     outputSchema: TABLES_RESULT_SCHEMA
   },
@@ -1147,6 +1372,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         tables: { type: "array", items: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN }, description: "Specific public table names to include; overrides limit and offset." },
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50, description: "Max tables to return. Default 50, hard cap 200." },
         offset: { type: "integer", minimum: 0, default: 0, description: "Number of tables to skip for pagination. Default 0." },
@@ -1171,6 +1397,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         table: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN, description: "Public table name to describe." }
       },
       required: ["table"]
@@ -1193,6 +1420,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         table: { type: "string", pattern: SAFE_IDENTIFIER_PATTERN, description: "Public table name to sample from." },
         limit: { type: "integer", minimum: 1, maximum: 10, default: 3, description: "Number of rows to return. Default 3, hard cap 10." }
       },
@@ -1216,6 +1444,7 @@ const TOOLS = [
       type: "object",
       additionalProperties: false,
       properties: {
+        project: PROJECT_ARG_SCHEMA,
         pattern: { type: "string", minLength: 1, description: "Case-insensitive text to search for in public table and column names." }
       },
       required: ["pattern"]
@@ -1338,7 +1567,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   }
 
   if (parsed.hostname === 'schema' && parsed.pathname === '/overview') {
-    return createJsonResource(uri, await getSchemaOverview({}));
+    return createJsonResource(uri, await getSchemaOverview({}, requireDefaultProject()));
   }
 
   if (parsed.hostname === 'session' && parsed.pathname === '/latest-query') {
@@ -1358,7 +1587,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     }
 
     if (resourceType === 'schema') {
-      return createJsonResource(uri, await getTableDescription(table));
+      return createJsonResource(uri, await getTableDescription(table, requireDefaultProject()));
     }
 
     if (resourceType === 'sample') {
@@ -1367,7 +1596,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         throw new McpError(ErrorCode.InvalidParams, `Invalid sample limit in resource URI: ${uri}`);
       }
 
-      return createJsonResource(uri, await getSampleData(table, limit));
+      return createJsonResource(uri, await getSampleData(table, limit, requireDefaultProject()));
     }
   }
 
@@ -1379,8 +1608,13 @@ async function completeArgument(params) {
   const name = params.argument?.name;
   const ref = params.ref || {};
 
+  if (name === "project") {
+    return createCompletionResult(filterCompletions(partial, projectNames()));
+  }
+
   if (name === "table" || name === "table_name") {
-    const { tables } = await getSchemaCache();
+    if (!DEFAULT_PROJECT) return createCompletionResult([]);
+    const { tables } = await getSchemaCache(DEFAULT_PROJECT);
     return createCompletionResult(filterCompletions(partial, tables));
   }
 
@@ -1428,10 +1662,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
 
   switch (name) {
+    case "list_projects": return handleListProjects();
     case "query": return await handleQuery(args);
     case "list_slow_queries": return await handleListSlowQueries(args);
     case "execute": return await handleExecute(args);
-    case "get_tables": return await handleGetTables();
+    case "get_tables": return await handleGetTables(args);
     case "get_schema": return await handleGetSchema(args);
     case "describe_table": return await handleDescribeTable(args);
     case "sample_data": return await handleSampleData(args);
@@ -1440,16 +1675,47 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function handleQuery(args) {
-  if (!args.sql) throw new McpError(ErrorCode.InvalidParams, "sql required");
+function handleListProjects() {
+  const projects = projectNames().map(name => {
+    const { host, database } = describeConnection(name);
+    return {
+      name,
+      host,
+      database,
+      default: name === DEFAULT_PROJECT,
+      readonly: READONLY_PROJECTS.has(name)
+    };
+  });
 
-  const prepared = prepareReadOnlySql(args.sql);
+  return createStructuredToolResult({
+    projects,
+    defaultProject: DEFAULT_PROJECT,
+    note: "Read tools default to the default project when no project argument is given. execute always requires an explicit project argument."
+  });
+}
+
+async function handleQuery(args) {
+  const project = resolveProject(args, { toolName: "query" });
+  const source = projectSource(project);
+
+  if (!args.sql) {
+    return createToolErrorResult("sql required", { error: "sql required" }, source);
+  }
+
+  let prepared;
+  try {
+    prepared = prepareReadOnlySql(args.sql);
+  } catch (error) {
+    return createToolErrorResult(error.message, { error: error.message }, source);
+  }
+
   const startedAt = Date.now();
 
   try {
-    const result = await runReadOnlyQuery(prepared.text, args.params || []);
+    const result = await runReadOnlyQuery(project, prepared.text, args.params || []);
 
     let response = {
+      source,
       rowCount: result.rowCount,
       rows: result.rows,
       fields: result.fields.map(f => ({ name: f.name, dataTypeID: f.dataTypeID })),
@@ -1464,12 +1730,14 @@ async function handleQuery(args) {
     response = budgetRowsPayload(response);
 
     updateLatestQueryResources({
+      project,
       sql: prepared.sql,
       result: response,
       isExplain: prepared.isExplain
     });
 
     await sendServerLog("info", "query", {
+      project,
       durationMs: recordDuration(startedAt),
       rowCount: response.rowCount,
       returnedRows: response.rows.length,
@@ -1480,13 +1748,14 @@ async function handleQuery(args) {
 
     return createStructuredToolResult(response);
   } catch (error) {
-    const enhanced = await enhanceError(error, prepared.sql);
+    const enhanced = await enhanceError(project, error, prepared.sql);
     await sendServerLog("error", "query", {
+      project,
       durationMs: recordDuration(startedAt),
       isExplain: prepared.isExplain,
       error: enhanced
     });
-    return createToolErrorResult(enhanced, { error: enhanced, sql: prepared.sql });
+    return createToolErrorResult(enhanced, { error: enhanced, sql: prepared.sql }, source);
   }
 }
 
@@ -1521,13 +1790,16 @@ function truncateSqlText(sql, maxLength = MAX_CELL_CHARS) {
 }
 
 async function handleListSlowQueries(args) {
+  const project = resolveProject(args, { toolName: "list_slow_queries" });
+  const source = projectSource(project);
   const startedAt = Date.now();
 
   try {
-    let response = await getSlowQueries(args);
+    let response = { source, ...(await getSlowQueries(args, project)) };
     response = budgetRowsPayload(response, "slowQueries");
 
     await sendServerLog("info", "list_slow_queries", {
+      project,
       durationMs: recordDuration(startedAt),
       extensionInstalled: response.extensionInstalled,
       totalQueriesFound: response.totalQueriesFound,
@@ -1538,17 +1810,18 @@ async function handleListSlowQueries(args) {
   } catch (error) {
     const message = error.message || "Failed to list slow queries";
     await sendServerLog("error", "list_slow_queries", {
+      project,
       durationMs: recordDuration(startedAt),
       error: message
     });
-    return createToolErrorResult(message, { error: message });
+    return createToolErrorResult(message, { error: message }, source);
   }
 }
 
-async function getSlowQueries(args) {
+async function getSlowQueries(args, project) {
   const { limit, minMeanMs, orderBy, orderBySql } = normalizeSlowQueryArgs(args);
 
-  const extensionCheck = await runReadOnlyQuery(`
+  const extensionCheck = await runReadOnlyQuery(project, `
     SELECT EXISTS (
       SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
     ) AS extension_installed
@@ -1567,7 +1840,7 @@ async function getSlowQueries(args) {
     };
   }
 
-  const result = await runReadOnlyQuery(`
+  const result = await runReadOnlyQuery(project, `
     SELECT
       queryid::text AS query_id,
       query,
@@ -1629,24 +1902,37 @@ async function getSlowQueries(args) {
 }
 
 async function handleExecute(args) {
-  if (!args.sql) throw new McpError(ErrorCode.InvalidParams, "sql required");
+  // Writes never fall back to a default connection: an explicit project is mandatory.
+  const project = resolveProject(args, { requireExplicit: true, toolName: "execute" });
+  const source = projectSource(project);
+
+  if (READONLY_PROJECTS.has(project)) {
+    const message = `Project "${project}" is listed in NEON_PG_READONLY_PROJECTS; execute is refused and nothing was run. Use the query tool for reads.`;
+    await sendServerLog("warning", "execute", { project, refused: "readonly" });
+    return createToolErrorResult(message, { error: message }, source);
+  }
+
+  if (!args.sql) {
+    return createToolErrorResult("sql required", { error: "sql required" }, source);
+  }
 
   if (args.sql.trim().toLowerCase().startsWith('select')) {
-    throw new McpError(ErrorCode.InvalidParams, "Use query tool for SELECT");
+    return createToolErrorResult("Use query tool for SELECT", { error: "Use query tool for SELECT" }, source);
   }
 
   const startedAt = Date.now();
 
   try {
-    const result = await pool.query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
+    const result = await getPool(project).query({ text: args.sql, values: args.params || [], statement_timeout: QUERY_TIMEOUT });
 
     // Invalidate schema cache on DDL statements
     const firstWord = args.sql.trim().split(/\s+/)[0].toUpperCase();
     if (['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME'].includes(firstWord)) {
-      invalidateSchemaCache();
+      invalidateSchemaCache(project);
     }
 
     await sendServerLog("notice", "execute", {
+      project,
       durationMs: recordDuration(startedAt),
       command: result.command,
       rowCount: result.rowCount,
@@ -1654,25 +1940,42 @@ async function handleExecute(args) {
     });
 
     return createStructuredToolResult({
+      source,
       command: result.command,
       rowCount: result.rowCount
     });
   } catch (error) {
-    const enhanced = await enhanceError(error, args.sql);
+    const enhanced = await enhanceError(project, error, args.sql);
     await sendServerLog("error", "execute", {
+      project,
       durationMs: recordDuration(startedAt),
       error: enhanced
     });
-    return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });
+    return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql }, source);
   }
 }
 
-async function handleGetTables() {
-  return createStructuredToolResult(await getTablesSummary());
+// Shared wrapper for simple read tools: resolves the project, stamps the
+// source on success, and converts failures into tool errors that still
+// state which project and database they ran against.
+async function runReadToolWithSource(args, toolName, fn) {
+  const project = resolveProject(args, { toolName });
+  const source = projectSource(project);
+
+  try {
+    return createStructuredToolResult({ source, ...(await fn(project)) });
+  } catch (error) {
+    const message = error?.message || String(error);
+    return createToolErrorResult(message, { error: message }, source);
+  }
 }
 
-async function getTablesSummary() {
-  const result = await pool.query(`
+async function handleGetTables(args) {
+  return runReadToolWithSource(args, "get_tables", getTablesSummary);
+}
+
+async function getTablesSummary(project) {
+  const result = await getPool(project).query(`
     SELECT t.table_name,
            pg_size_pretty(pg_total_relation_size(quote_ident(t.table_name))) as size,
            (SELECT count(*) FROM information_schema.columns c
@@ -1686,10 +1989,11 @@ async function getTablesSummary() {
 }
 
 async function handleGetSchema(args) {
-  return createStructuredToolResult(await getSchemaOverview(args));
+  return runReadToolWithSource(args, "get_schema", project => getSchemaOverview(args, project));
 }
 
-async function getSchemaOverview(args) {
+async function getSchemaOverview(args, project) {
+  const pool = getPool(project);
   // Build exclusion clause for backup/archive tables
   const includeAll = args.include_all === true;
   const excludeClause = includeAll ? '' : `
@@ -1772,13 +2076,13 @@ async function getSchemaOverview(args) {
 }
 
 async function handleDescribeTable(args) {
-  if (!args.table) throw new McpError(ErrorCode.InvalidParams, "table required");
-  return createStructuredToolResult(await getTableDescription(args.table));
+  return runReadToolWithSource(args, "describe_table", project => getTableDescription(args.table, project));
 }
 
-async function getTableDescription(tableName) {
+async function getTableDescription(tableName, project) {
   if (!tableName) throw new McpError(ErrorCode.InvalidParams, "table required");
   assertSafeIdentifier(tableName, 'table name');
+  const pool = getPool(project);
 
   const [cols, pks, fks, idxs, stats] = await Promise.all([
     // Get columns with enum type names
@@ -1890,12 +2194,12 @@ async function getTableDescription(tableName) {
 }
 
 async function handleSampleData(args) {
-  if (!args.table) throw new McpError(ErrorCode.InvalidParams, "table required");
-  return createStructuredToolResult(await getSampleData(args.table, args.limit));
+  return runReadToolWithSource(args, "sample_data", project => getSampleData(args.table, args.limit, project));
 }
 
-async function getSampleData(tableName, requestedLimit) {
-  const { tables } = await getSchemaCache();
+async function getSampleData(tableName, requestedLimit, project) {
+  if (!tableName) throw new McpError(ErrorCode.InvalidParams, "table required");
+  const { tables } = await getSchemaCache(project);
   if (!tables.includes(tableName)) {
     const suggestions = findSimilar(tableName, tables);
     throw new McpError(ErrorCode.InvalidParams,
@@ -1907,7 +2211,7 @@ async function getSampleData(tableName, requestedLimit) {
   const limit = Math.min(Math.max(1, requestedLimit || 3), 10);
 
   try {
-    const result = await pool.query(`
+    const result = await getPool(project).query(`
       SELECT * FROM ${tableName}
       LIMIT ${limit}
     `);
@@ -1940,21 +2244,21 @@ async function getSampleData(tableName, requestedLimit) {
 
     return budgetRowsPayload(output);
   } catch (error) {
-    const enhanced = await enhanceError(error, `SELECT * FROM ${tableName}`);
+    const enhanced = await enhanceError(project, error, `SELECT * FROM ${tableName}`);
     throw new McpError(ErrorCode.InvalidParams, enhanced);
   }
 }
 
 async function handleSearchSchema(args) {
-  if (!args.pattern) throw new McpError(ErrorCode.InvalidParams, "pattern required");
-  return createStructuredToolResult(await searchSchema(args.pattern));
+  return runReadToolWithSource(args, "search_schema", project => searchSchema(args.pattern, project));
 }
 
-async function searchSchema(rawPattern) {
+async function searchSchema(rawPattern, project) {
+  if (!rawPattern) throw new McpError(ErrorCode.InvalidParams, "pattern required");
   const pattern = rawPattern.toLowerCase();
 
   // Search tables and columns
-  const result = await pool.query(`
+  const result = await getPool(project).query(`
     SELECT
       t.table_name,
       c.column_name,
@@ -2001,7 +2305,15 @@ async function searchSchema(rawPattern) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error("neon-pg MCP v1.7.0");
+console.error(`neon-pg MCP v1.8.0 — projects: ${projectNames().map(name => {
+  const { host, database } = describeConnection(name);
+  const markers = `${name === DEFAULT_PROJECT ? '*' : ''}${READONLY_PROJECTS.has(name) ? ' [readonly]' : ''}`;
+  return `${name}${markers} (${database ?? '?'} @ ${host ?? '?'})`;
+}).join(', ')}`);
 
-process.on('SIGINT', async () => { await pool.end(); process.exit(0); });
-process.on('SIGTERM', async () => { await pool.end(); process.exit(0); });
+async function closePools() {
+  await Promise.all([...pools.values()].map(pool => pool.end().catch(() => {})));
+}
+
+process.on('SIGINT', async () => { await closePools(); process.exit(0); });
+process.on('SIGTERM', async () => { await closePools(); process.exit(0); });

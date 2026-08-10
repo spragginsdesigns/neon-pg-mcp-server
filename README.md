@@ -43,10 +43,55 @@ cd neon-pg-server
 npm install
 ```
 
-3. Set up your Neon PostgreSQL connection string as an environment variable:
+3. Configure your Neon PostgreSQL connection(s) via environment variables (see below):
 ```bash
 export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmode=require"
 ```
+
+## Environment Variables
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `NEON_PG_CONNECTION_STRING` | one of the two | Single connection string, registered as the project named `default`. The original single-database setup — still fully supported. |
+| `NEON_PG_CONNECTIONS` | one of the two | JSON object mapping project names to connection strings, e.g. `{"versemind":"postgresql://...","linecrush":"postgresql://..."}`. Can be combined with `NEON_PG_CONNECTION_STRING`. |
+| `NEON_PG_READONLY_PROJECTS` | no | Comma-separated project names for which the `execute` tool is refused outright (reads still work). |
+
+At least one of the first two must be set. If both define a project named `default`, the `NEON_PG_CONNECTIONS` entry wins (a warning is logged to stderr).
+
+### Multi-Project Setup
+
+One server instance can serve several Neon projects. Pools are created lazily per project on first use, so configuring six projects does not open six pools at startup.
+
+```json
+{
+  "neon-pg": {
+    "command": "node",
+    "args": ["/path/to/neon-pg-server/pg-mcp-server.js"],
+    "env": {
+      "NEON_PG_CONNECTION_STRING": "postgresql://user:pw@ep-old-host.aws.neon.tech/verceldb?sslmode=require",
+      "NEON_PG_CONNECTIONS": "{\"versemind\":\"postgresql://user:pw@ep-vm-host.aws.neon.tech/neondb?sslmode=require\",\"linecrush\":\"postgresql://user:pw@ep-lc-host.aws.neon.tech/verceldb?sslmode=require\"}",
+      "NEON_PG_READONLY_PROJECTS": "linecrush"
+    }
+  }
+}
+```
+
+With this config:
+- `get_tables` with no arguments runs against `default` (the legacy connection string) — existing setups keep working unchanged.
+- `get_tables` with `project: "versemind"` runs against the versemind database.
+- `execute` with `project: "linecrush"` is refused because linecrush is in `NEON_PG_READONLY_PROJECTS`.
+- `list_projects` shows all three names with their host and database (never credentials).
+
+**Default project resolution:** the project named `default` (from `NEON_PG_CONNECTION_STRING` or a `default` key in `NEON_PG_CONNECTIONS`) is the default for read tools. If no `default` exists but exactly one project is configured, that one is the default. With multiple named projects and no `default`, read tools require an explicit `project` argument.
+
+### Multi-Project Safety Rules
+
+These exist so it is impossible to read a tool result — or run a write — without knowing which database it touched:
+
+1. **`execute` always requires an explicit `project` argument.** There is no default and no inference for writes; a missing or unknown project is an error that lists the valid names and runs nothing.
+2. **Every tool result carries a `source` block** (`project`, `database`, `host`) — success or error, read or write. Error text is prefixed with `[project=... database=...]`.
+3. **`NEON_PG_READONLY_PROJECTS`** hard-blocks `execute` per project, even with an explicit `project` argument.
+4. MCP resources (`neon://...`) are served from the default project only.
 
 ## Usage
 
@@ -103,7 +148,14 @@ node build/index.js
 
 ## Available Tools
 
-Production `pg-mcp-server.js` exposes 8 tools. Each tool includes Claude/Codex-friendly titles, read/write annotations, structured output schemas, and JSON text fallbacks.
+Production `pg-mcp-server.js` exposes 9 tools. Each tool includes Claude/Codex-friendly titles, read/write annotations, structured output schemas, and JSON text fallbacks.
+
+Every tool except `list_projects` accepts an optional `project` argument selecting the named connection to run against (default: the `default` project). On `execute` the `project` argument is **required**. Every result includes a `source` block stating the project, database, and host it ran against.
+
+### 0. List Projects Tool
+List the configured project connections: name, host, database, default flag, and read-only flag. Never returns credentials.
+
+**Parameters:** None
 
 ### 1. Query Tool
 Execute read-only SELECT, WITH, and EXPLAIN queries to retrieve data from your database.
@@ -120,11 +172,14 @@ SELECT * FROM users WHERE age > $1
 ```
 
 ### 2. Execute Tool
-Execute SQL statements that modify data (INSERT, UPDATE, DELETE).
+Execute SQL statements that modify data (INSERT, UPDATE, DELETE, DDL).
 
 **Parameters:**
 - `sql` (required): SQL statement to execute
+- `project` (**required**): Named project to write to — no default is applied for writes
 - `params` (optional): Array of statement parameters
+
+Refused outright for projects listed in `NEON_PG_READONLY_PROJECTS`.
 
 **Example:**
 ```sql
@@ -189,8 +244,10 @@ Search public table and column names by case-insensitive text pattern.
 
 ## Security Considerations
 
-- **Connection String**: Store your connection string as an environment variable, never commit it to version control
+- **Connection String**: Store your connection strings as environment variables, never commit them to version control
 - **SSL/TLS**: The server enforces SSL connections to Neon PostgreSQL
+- **Source Attribution**: Every tool result and error names the project, database, and host it ran against, so results can never be misattributed to the wrong database
+- **Write Targeting**: `execute` requires an explicit `project` argument and honors `NEON_PG_READONLY_PROJECTS`
 - **Query Validation**: The server validates that:
   - Query tool only accepts SELECT, WITH, and EXPLAIN statements
   - Query tool runs inside a read-only transaction

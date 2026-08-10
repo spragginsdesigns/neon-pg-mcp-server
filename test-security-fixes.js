@@ -79,8 +79,8 @@ test('rejects name with parens', () => {
 // ── Schema cache TTL + invalidation ──
 console.error('\n── Schema cache TTL & invalidation ──');
 
-test('source contains cacheTimestamp variable', () => {
-  assert(serverSource.includes('let cacheTimestamp = 0'), 'should have cacheTimestamp');
+test('source contains per-project schema cache map', () => {
+  assert(serverSource.includes('const schemaCaches = new Map()'), 'should have per-project schemaCaches');
 });
 
 test('source contains CACHE_TTL constant', () => {
@@ -88,22 +88,20 @@ test('source contains CACHE_TTL constant', () => {
 });
 
 test('source contains invalidateSchemaCache function', () => {
-  assert(serverSource.includes('function invalidateSchemaCache()'), 'should have invalidateSchemaCache');
+  assert(serverSource.includes('function invalidateSchemaCache(project)'), 'should have invalidateSchemaCache');
 });
 
-test('invalidateSchemaCache resets all cache state', () => {
-  assert(serverSource.includes('cachedTables = null'), 'should reset cachedTables');
-  assert(serverSource.includes('cachedColumns = null'), 'should reset cachedColumns');
-  assert(serverSource.includes('cacheTimestamp = 0'), 'should reset cacheTimestamp');
+test('invalidateSchemaCache drops the project cache entry', () => {
+  assert(serverSource.includes('schemaCaches.delete(project)'), 'should delete the project cache entry');
 });
 
 test('getSchemaCache checks TTL', () => {
-  assert(serverSource.includes('Date.now() - cacheTimestamp > CACHE_TTL'), 'should check TTL');
+  assert(serverSource.includes('Date.now() - cached.timestamp <= CACHE_TTL'), 'should check TTL');
 });
 
 test('DDL detection in handleExecute', () => {
   assert(serverSource.includes("['CREATE', 'ALTER', 'DROP', 'TRUNCATE', 'RENAME']"), 'should detect DDL keywords');
-  assert(serverSource.includes('invalidateSchemaCache()'), 'should call invalidateSchemaCache');
+  assert(serverSource.includes('invalidateSchemaCache(project)'), 'should call invalidateSchemaCache');
 });
 
 // ── Query validation ──
@@ -145,7 +143,7 @@ test('detects top-level LIMIT/FETCH clauses', () => {
 });
 
 test('runs query tool statements in a read-only transaction', () => {
-  assert(serverSource.includes('async function runReadOnlyQuery(text, params = [])'), 'should use read-only query helper');
+  assert(serverSource.includes('async function runReadOnlyQuery(project, text, params = [])'), 'should use read-only query helper');
   assert(serverSource.includes("client.query('BEGIN READ ONLY')"), 'should begin read-only transaction');
   assert(serverSource.includes('SET LOCAL statement_timeout'), 'should set statement timeout in transaction');
 });
@@ -205,12 +203,12 @@ test('JSONB loop validates column identifier', () => {
 // ── Version ──
 console.error('\n── Version ──');
 
-test('server version is 1.7.0', () => {
-  assert(serverSource.includes('version: "1.7.0"'), 'server config should be 1.7.0');
+test('server version is 1.8.0', () => {
+  assert(serverSource.includes('version: "1.8.0"'), 'server config should be 1.8.0');
 });
 
-test('startup log is v1.7.0', () => {
-  assert(serverSource.includes('neon-pg MCP v1.7.0'), 'startup log should be v1.7.0');
+test('startup log is v1.8.0', () => {
+  assert(serverSource.includes('neon-pg MCP v1.8.0'), 'startup log should be v1.8.0');
 });
 
 // ── Structured MCP outputs ──
@@ -225,12 +223,12 @@ test('tool definitions include output schemas', () => {
 test('server source returns structuredContent from tools', () => {
   assert(serverSource.includes('structuredContent: data'), 'should include structuredContent helper');
   assert(serverSource.includes('return createStructuredToolResult(response);'), 'query should return structured results');
-  assert(serverSource.includes('return createStructuredToolResult(await getTablesSummary());'), 'get_tables should return structured results');
+  assert(serverSource.includes('createStructuredToolResult({ source, ...(await fn(project)) })'), 'read tools should return structured results stamped with source');
 });
 
 test('tool errors can include structured content', () => {
-  assert(serverSource.includes('result.structuredContent = structuredContent'), 'error helper should include structured content');
-  assert(serverSource.includes('return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql });'), 'tool errors should return structured details');
+  assert(serverSource.includes('result.structuredContent = structured'), 'error helper should include structured content');
+  assert(serverSource.includes('return createToolErrorResult(enhanced, { error: enhanced, sql: args.sql }, source);'), 'tool errors should return structured details with their source');
 });
 
 // ── MCP resources ──
