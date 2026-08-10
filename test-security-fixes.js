@@ -83,6 +83,12 @@ test('source contains per-project schema cache map', () => {
   assert(serverSource.includes('const schemaCaches = new Map()'), 'should have per-project schemaCaches');
 });
 
+test('connection sources merge string, file, then inline JSON', () => {
+  assert(serverSource.includes("connections.set('default', single)"), 'should register legacy string as default');
+  assert(serverSource.includes('NEON_PG_CONNECTIONS_FILE'), 'should support a connections file');
+  assert(serverSource.includes('function addConnectionsJson(raw, label, connections)'), 'both JSON sources should share one validator');
+});
+
 test('source contains CACHE_TTL constant', () => {
   assert(serverSource.includes('CACHE_TTL'), 'should have CACHE_TTL');
 });
@@ -203,12 +209,12 @@ test('JSONB loop validates column identifier', () => {
 // ── Version ──
 console.error('\n── Version ──');
 
-test('server version is 1.8.0', () => {
-  assert(serverSource.includes('version: "1.8.0"'), 'server config should be 1.8.0');
+test('server version is 1.9.0', () => {
+  assert(serverSource.includes('version: "1.9.0"'), 'server config should be 1.9.0');
 });
 
-test('startup log is v1.8.0', () => {
-  assert(serverSource.includes('neon-pg MCP v1.8.0'), 'startup log should be v1.8.0');
+test('startup log is v1.9.0', () => {
+  assert(serverSource.includes('neon-pg MCP v1.9.0'), 'startup log should be v1.9.0');
 });
 
 // ── Structured MCP outputs ──

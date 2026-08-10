@@ -14,9 +14,38 @@ import {
   McpError
 } from "@modelcontextprotocol/sdk/types.js";
 import pg from 'pg';
+import { readFileSync } from 'node:fs';
 
 const PROJECT_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 
+function addConnectionsJson(raw, label, connections) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`${label} must be valid JSON mapping project names to connection strings: ${error.message}`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object mapping project names to connection strings`);
+  }
+  for (const [name, connectionString] of Object.entries(parsed)) {
+    if (!PROJECT_NAME_PATTERN.test(name)) {
+      throw new Error(`${label} project name "${name}" is invalid; use letters, digits, "_", "-", or "."`);
+    }
+    if (typeof connectionString !== 'string' || connectionString.length === 0) {
+      throw new Error(`${label} entry "${name}" must be a non-empty connection string`);
+    }
+    if (connections.has(name)) {
+      console.error(`neon-pg: ${label} entry "${name}" overrides an earlier definition`);
+    }
+    connections.set(name, connectionString);
+  }
+}
+
+// Sources are merged in order; later sources override earlier ones per name:
+// 1. NEON_PG_CONNECTION_STRING          -> project "default" (legacy single setup)
+// 2. NEON_PG_CONNECTIONS_FILE (JSON)    -> shared per-machine connections map
+// 3. NEON_PG_CONNECTIONS (inline JSON)  -> per-registration overrides
 function loadConnections() {
   const connections = new Map();
 
@@ -25,33 +54,24 @@ function loadConnections() {
     connections.set('default', single);
   }
 
+  const filePath = process.env.NEON_PG_CONNECTIONS_FILE;
+  if (filePath) {
+    let raw;
+    try {
+      raw = readFileSync(filePath, 'utf8');
+    } catch (error) {
+      throw new Error(`NEON_PG_CONNECTIONS_FILE could not be read (${filePath}): ${error.message}`);
+    }
+    addConnectionsJson(raw, `NEON_PG_CONNECTIONS_FILE (${filePath})`, connections);
+  }
+
   const multiRaw = process.env.NEON_PG_CONNECTIONS;
   if (multiRaw) {
-    let parsed;
-    try {
-      parsed = JSON.parse(multiRaw);
-    } catch (error) {
-      throw new Error(`NEON_PG_CONNECTIONS must be valid JSON mapping project names to connection strings: ${error.message}`);
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('NEON_PG_CONNECTIONS must be a JSON object mapping project names to connection strings');
-    }
-    for (const [name, connectionString] of Object.entries(parsed)) {
-      if (!PROJECT_NAME_PATTERN.test(name)) {
-        throw new Error(`NEON_PG_CONNECTIONS project name "${name}" is invalid; use letters, digits, "_", "-", or "."`);
-      }
-      if (typeof connectionString !== 'string' || connectionString.length === 0) {
-        throw new Error(`NEON_PG_CONNECTIONS entry "${name}" must be a non-empty connection string`);
-      }
-      if (name === 'default' && connections.has('default')) {
-        console.error('neon-pg: NEON_PG_CONNECTIONS "default" overrides NEON_PG_CONNECTION_STRING');
-      }
-      connections.set(name, connectionString);
-    }
+    addConnectionsJson(multiRaw, 'NEON_PG_CONNECTIONS', connections);
   }
 
   if (connections.size === 0) {
-    throw new Error('Set NEON_PG_CONNECTION_STRING (single database) or NEON_PG_CONNECTIONS (JSON map of project name -> connection string)');
+    throw new Error('Set NEON_PG_CONNECTION_STRING (single database), NEON_PG_CONNECTIONS (JSON map of project name -> connection string), or NEON_PG_CONNECTIONS_FILE (path to that JSON)');
   }
 
   return connections;
@@ -1220,7 +1240,7 @@ function requireDefaultProject() {
 }
 
 const server = new Server(
-  { name: "neon-pg", version: "1.8.0" },
+  { name: "neon-pg", version: "1.9.0" },
   {
     capabilities: {
       tools: {},
@@ -2313,7 +2333,7 @@ async function searchSchema(rawPattern, project) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`neon-pg MCP v1.8.0 — projects: ${[...PROJECT_INFO.values()].map(p =>
+console.error(`neon-pg MCP v1.9.0 — projects: ${[...PROJECT_INFO.values()].map(p =>
   `${p.name}${p.default ? '*' : ''}${p.readonly ? ' [readonly]' : ''} (${p.database ?? '?'} @ ${p.host ?? '?'})`
 ).join(', ')}`);
 

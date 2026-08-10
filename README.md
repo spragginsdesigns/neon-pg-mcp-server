@@ -53,10 +53,11 @@ export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmo
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `NEON_PG_CONNECTION_STRING` | one of the two | Single connection string, registered as the project named `default`. The original single-database setup — still fully supported. |
-| `NEON_PG_CONNECTIONS` | one of the two | JSON object mapping project names to connection strings, e.g. `{"versemind":"postgresql://...","linecrush":"postgresql://..."}`. Can be combined with `NEON_PG_CONNECTION_STRING`. |
+| `NEON_PG_CONNECTIONS` | one of the three | JSON object mapping project names to connection strings, e.g. `{"versemind":"postgresql://...","linecrush":"postgresql://..."}`. Can be combined with `NEON_PG_CONNECTION_STRING`. |
+| `NEON_PG_CONNECTIONS_FILE` | one of the three | Path to a JSON file with the same name → connection-string map. Useful for sharing one connections map across many MCP registrations on a machine (keep the file out of version control, e.g. `~/.secrets/neon-connections.json`). |
 | `NEON_PG_READONLY_PROJECTS` | no | Comma-separated project names for which the `execute` tool is refused outright (reads still work). |
 
-At least one of the first two must be set. If both define a project named `default`, the `NEON_PG_CONNECTIONS` entry wins (a warning is logged to stderr).
+At least one of the first three must be set. Sources merge in order — `NEON_PG_CONNECTION_STRING` (as `default`), then `NEON_PG_CONNECTIONS_FILE`, then `NEON_PG_CONNECTIONS` — with later sources overriding earlier ones per name (a warning is logged to stderr on override).
 
 ### Multi-Project Setup
 

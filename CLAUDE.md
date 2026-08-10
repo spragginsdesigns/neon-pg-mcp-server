@@ -80,6 +80,7 @@ At least one of the first two is required:
 
 - `NEON_PG_CONNECTION_STRING` - Single Neon connection string with SSL, registered as project `default` (legacy setup, still supported)
 - `NEON_PG_CONNECTIONS` - JSON map of project name -> connection string for multi-project setups
+- `NEON_PG_CONNECTIONS_FILE` - Path to a JSON file with the same map; lets many registrations on one machine share a single gitignored connections file. Merge order: string, then file, then inline JSON (later wins per name)
 - `NEON_PG_READONLY_PROJECTS` - Optional comma-separated project names where `execute` is refused
 
 ```bash
@@ -155,6 +156,6 @@ git commit -m "type(scope): msg"  # Conventional commit
 ### Testing Changes
 
 1. Set `NEON_PG_CONNECTION_STRING` (and/or `NEON_PG_CONNECTIONS`) environment variable
-2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.8.0" plus the configured project list to stderr
+2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.9.0" plus the configured project list to stderr
 3. Test with MCP client or send JSON-RPC via stdin
 4. Run `node test-security-fixes.js` for the source-level regression suite
