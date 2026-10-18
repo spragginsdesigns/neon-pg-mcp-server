@@ -219,7 +219,7 @@ Get detailed structure information about a specific public table.
 
 **Returns:** 
 - Column information (name, data type, nullable, default value)
-- Primary key columns, foreign keys, indexes, enum values, JSONB keys, size, row estimate
+- Primary key columns, foreign keys, indexes, enum values, JSONB keys (sampled from up to 50 non-null rows per column), size, row estimate
 
 ### 7. Sample Data Tool
 Return a few rows from a public table plus inferred JSONB structure.

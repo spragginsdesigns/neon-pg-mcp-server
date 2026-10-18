@@ -209,12 +209,12 @@ test('JSONB loop validates column identifier', () => {
 // ── Version ──
 console.error('\n── Version ──');
 
-test('server version is 1.9.0', () => {
-  assert(serverSource.includes('version: "1.9.0"'), 'server config should be 1.9.0');
+test('server version is 1.9.1', () => {
+  assert(serverSource.includes('version: "1.9.1"'), 'server config should be 1.9.1');
 });
 
-test('startup log is v1.9.0', () => {
-  assert(serverSource.includes('neon-pg MCP v1.9.0'), 'startup log should be v1.9.0');
+test('startup log is v1.9.1', () => {
+  assert(serverSource.includes('neon-pg MCP v1.9.1'), 'startup log should be v1.9.1');
 });
 
 // ── Structured MCP outputs ──
@@ -334,6 +334,12 @@ test('query and sample data are protected by payload budgeting', () => {
   assert(serverSource.includes('response = budgetRowsPayload(response);'), 'query should budget payloads');
   assert(serverSource.includes('return budgetRowsPayload(output);'), 'sample_data should budget payloads');
   assert(serverSource.includes('response = budgetRowsPayload(response, "slowQueries");'), 'list_slow_queries should budget payloads');
+});
+
+test('describe_table samples rows before listing JSONB keys', () => {
+  assert(!serverSource.includes('SELECT DISTINCT jsonb_object_keys('), 'should not DISTINCT over every row of a JSONB column');
+  assert(serverSource.includes('LIMIT ${JSONB_KEYS_SAMPLE_ROWS}'), 'should bound the sampled rows');
+  assert(serverSource.includes('SET LOCAL statement_timeout = ${JSONB_KEYS_TIMEOUT};'), 'should cap the sample statement time');
 });
 
 // ── Summary ──

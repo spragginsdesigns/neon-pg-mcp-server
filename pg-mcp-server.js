@@ -171,6 +171,8 @@ function resolveProject(args, { forWrite = false, toolName = 'this tool' } = {})
 
 const MAX_ROWS = 100;
 const QUERY_TIMEOUT = 30000;
+const JSONB_KEYS_SAMPLE_ROWS = 50;
+const JSONB_KEYS_TIMEOUT = 3000;
 const RESOURCE_PAGE_SIZE = 100;
 const MAX_TOOL_RESPONSE_CHARS = 130000;
 const MAX_CELL_CHARS = 4000;
@@ -1240,7 +1242,7 @@ function requireDefaultProject() {
 }
 
 const server = new Server(
-  { name: "neon-pg", version: "1.9.0" },
+  { name: "neon-pg", version: "1.9.1" },
   {
     capabilities: {
       tools: {},
@@ -1425,7 +1427,7 @@ const TOOLS = [
   {
     name: "describe_table",
     title: "Describe Table",
-    description: "Return detailed structure for one public table: columns, primary keys, foreign keys, indexes, enum values, JSONB keys, size, and row estimate.",
+    description: "Return detailed structure for one public table: columns, primary keys, foreign keys, indexes, enum values, JSONB keys sampled from up to 50 non-null rows, size, and row estimate.",
     annotations: {
       title: "Describe Table",
       readOnlyHint: true,
@@ -2175,24 +2177,33 @@ async function getTableDescription(tableName, project) {
     }
   }
 
-  // Get JSONB column keys (sample from first row with data)
+  // Get JSONB column keys from a bounded sample of non-null rows. DISTINCT over
+  // the whole column detoasts every row (one vibe_bets call read 43 GB), so
+  // sample first and cap the statement time. Both statements go in one
+  // simple-query message, which runs as an implicit transaction, so SET LOCAL
+  // bounds only this SELECT and costs no extra round trip.
   const jsonbCols = cols.rows.filter(c => c.type === 'jsonb');
   let jsonbKeys = {};
 
   for (const jcol of jsonbCols) {
     try {
       assertSafeIdentifier(jcol.col, 'column name');
-      const keysResult = await pool.query(`
-        SELECT DISTINCT jsonb_object_keys(${jcol.col}) as key
-        FROM ${tableName}
-        WHERE ${jcol.col} IS NOT NULL
+      const [, keysResult] = await pool.query(`
+        SET LOCAL statement_timeout = ${JSONB_KEYS_TIMEOUT};
+        SELECT DISTINCT k.key
+        FROM (
+          SELECT ${jcol.col} as doc FROM ${tableName}
+          WHERE ${jcol.col} IS NOT NULL
+          LIMIT ${JSONB_KEYS_SAMPLE_ROWS}
+        ) sampled
+        CROSS JOIN LATERAL jsonb_object_keys(sampled.doc) as k(key)
         LIMIT 15
       `);
       if (keysResult.rows.length > 0) {
         jsonbKeys[jcol.col] = keysResult.rows.map(r => r.key);
       }
     } catch (e) {
-      // Column might have non-object jsonb, skip
+      // Column might have non-object jsonb or hit the sample timeout, skip
     }
   }
 
@@ -2333,7 +2344,7 @@ async function searchSchema(rawPattern, project) {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`neon-pg MCP v1.9.0 — projects: ${[...PROJECT_INFO.values()].map(p =>
+console.error(`neon-pg MCP v1.9.1 — projects: ${[...PROJECT_INFO.values()].map(p =>
   `${p.name}${p.default ? '*' : ''}${p.readonly ? ' [readonly]' : ''} (${p.database ?? '?'} @ ${p.host ?? '?'})`
 ).join(', ')}`);
 

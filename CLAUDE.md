@@ -47,7 +47,7 @@ Production `pg-mcp-server.js` exposes 9 tools:
 - `list_slow_queries` - Read-only `pg_stat_statements` performance hotspots
 - `get_tables` - List tables in public schema
 - `get_schema` - Schema overview with pagination and backup/archive filtering
-- `describe_table` - Table structure, columns, keys, indexes, enums, JSONB keys
+- `describe_table` - Table structure, columns, keys, indexes, enums, JSONB keys (sampled from up to 50 non-null rows per column, 3s cap)
 - `sample_data` - Small row samples with inferred JSONB structures
 - `search_schema` - Table and column name search
 
@@ -156,6 +156,6 @@ git commit -m "type(scope): msg"  # Conventional commit
 ### Testing Changes
 
 1. Set `NEON_PG_CONNECTION_STRING` (and/or `NEON_PG_CONNECTIONS`) environment variable
-2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.9.0" plus the configured project list to stderr
+2. Run `node pg-mcp-server.js` - should output "neon-pg MCP v1.9.1" plus the configured project list to stderr
 3. Test with MCP client or send JSON-RPC via stdin
 4. Run `node test-security-fixes.js` for the source-level regression suite
