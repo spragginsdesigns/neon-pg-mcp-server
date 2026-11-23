@@ -85,8 +85,8 @@ At least one of the first two is required:
 
 ```bash
 export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmode=require"
-export NEON_PG_CONNECTIONS='{"versemind":"postgresql://...","linecrush":"postgresql://..."}'
-export NEON_PG_READONLY_PROJECTS="linecrush"
+export NEON_PG_CONNECTIONS='{"app":"postgresql://...","analytics":"postgresql://..."}'
+export NEON_PG_READONLY_PROJECTS="analytics"
 ```
 
 ## MCP Integration
