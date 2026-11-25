@@ -191,27 +191,24 @@ const SERVER_INSTRUCTIONS = [
 ].join(" ");
 
 const COMMON_SURFACES = [
-  "picks",
-  "sonar",
-  "games",
   "users",
-  "players",
-  "videos",
-  "x_scraper",
-  "bot_analysis",
-  "vibe_bet_generator",
-  "referrals",
+  "accounts",
+  "auth",
   "subscriptions",
-  "odds"
+  "payments",
+  "orders",
+  "products",
+  "notifications",
+  "events",
+  "referrals"
 ];
 
 const COMMON_PIPELINES = [
-  "vibe_reports_to_vibe_bets",
-  "x_tweets_to_bot_analysis",
-  "odds_feed_to_sonar",
-  "games_to_picks",
-  "users_to_referrals",
-  "videos_to_analysis"
+  "signups_to_subscriptions",
+  "orders_to_payments",
+  "webhooks_to_events",
+  "events_to_notifications",
+  "users_to_referrals"
 ];
 
 const GENERIC_OBJECT_SCHEMA = {
@@ -1062,9 +1059,9 @@ function getPrompt(name, args = {}) {
   switch (name) {
     case "understand_schema":
       return {
-        description: "Orient yourself to the LineCrush database before writing queries.",
+        description: "Orient yourself to this database before writing queries.",
         messages: [
-          promptTextMessage(`You are working with the LineCrush database in Neon Postgres.
+          promptTextMessage(`You are working with a Neon Postgres database.
 
 Start by building a live mental model from the database itself instead of assuming the schema from memory.
 
@@ -1075,11 +1072,11 @@ Follow this workflow:
 4. Use \`sample_data\` to inspect real row shapes and values before writing complex queries.
 5. Summarize the key relationships, major product surfaces, and likely source-of-truth tables before proceeding.
 
-Important LineCrush context:
-- Product surfaces often include picks, vibe bet generation, sonar, games, users, players, videos, x/twitter ingestion, bot analysis, and odds pipelines.
-- Sport names are usually uppercase strings like NBA, NFL, MLB, NHL, MMA, BKFC, PGA, EPL, Boxing, Tennis, F1, WNBA, and NASCAR.
-- Large tables should be filtered aggressively; avoid broad \`SELECT *\` queries on huge event or odds tables.
-- JSONB columns are common, especially for odds, reports, and analysis payloads, so inspect JSONB keys before filtering.
+Things to keep in mind:
+- Check the source block on every result so you know which project and database you are reading.
+- Large tables should be filtered aggressively; avoid broad \`SELECT *\` queries on huge event, log, or history tables.
+- Inspect JSONB keys before filtering on them, because payload, settings, and metadata columns often hold the field you need.
+- Check enum and text columns for exact casing before filtering on string values.
 
 Use the tools to discover the current truth, then explain the schema in plain language.`)
         ]
@@ -1087,9 +1084,9 @@ Use the tools to discover the current truth, then explain the schema in plain la
     case "investigate_product_surface": {
       const surfaceName = requirePromptArg(args, "surface_name");
       return {
-        description: `Investigate how the ${surfaceName} surface works in the LineCrush database.`,
+        description: `Investigate how the ${surfaceName} surface works in this database.`,
         messages: [
-          promptTextMessage(`Investigate the LineCrush product surface "${surfaceName}" using the live database schema.
+          promptTextMessage(`Investigate the product surface "${surfaceName}" using the live database schema.
 
 Do this in order:
 1. Use \`search_schema\` to find all tables whose names or columns seem related to "${surfaceName}".
@@ -1098,7 +1095,7 @@ Do this in order:
 4. Map the data flow:
    - where records are created
    - which tables reference each other
-   - which columns likely drive frontend behavior, alerts, generation, grading, ingestion, or user state
+   - which columns likely drive frontend behavior, alerts, background jobs, ingestion, or user state
 5. Call out heavy JSONB columns, enums, foreign keys, and large tables that need careful filtering.
 6. Summarize:
    - what this surface does in the product
@@ -1106,7 +1103,7 @@ Do this in order:
    - which tables are upstream/downstream
    - what an engineer should know before changing it
 
-Use live schema discovery, not assumptions. If the surface touches multiple systems like scraping, generation, grading, odds, or frontend delivery, explain how they connect.`)
+Use live schema discovery, not assumptions. If the surface touches multiple systems like ingestion, background jobs, billing, or frontend delivery, explain how they connect.`)
         ]
       };
     }
@@ -1115,7 +1112,7 @@ Use live schema discovery, not assumptions. If the surface touches multiple syst
       return {
         description: `Explore the ${tableName} table in depth.`,
         messages: [
-          promptTextMessage(`Explore the table "${tableName}" in the LineCrush database. Do this in order:
+          promptTextMessage(`Explore the table "${tableName}" in this database. Do this in order:
 
 1. Run \`describe_table\` for "${tableName}" to inspect columns, types, foreign keys, indexes, enums, and JSONB key structures.
 2. Run \`sample_data\` for "${tableName}" to inspect real row shapes and actual values.
@@ -1135,9 +1132,9 @@ Focus on practical understanding, not just column listing.`)
       const failingSql = requirePromptArg(args, "failing_sql");
       const errorMessage = args.error_message || "No error message provided.";
       return {
-        description: "Debug a failing or unexpected SQL query against the LineCrush database.",
+        description: "Debug a failing or unexpected SQL query against this database.",
         messages: [
-          promptTextMessage(`A SQL query against the LineCrush database is failing or returning unexpected results.
+          promptTextMessage(`A SQL query against this database is failing or returning unexpected results.
 
 Failing SQL:
 \`\`\`sql
@@ -1151,12 +1148,12 @@ Investigate using this workflow:
 1. Parse the query and identify all referenced tables, joins, filters, and columns.
 2. Use \`search_schema\` to confirm the referenced tables and discover similarly named alternatives if needed.
 3. Use \`describe_table\` on each relevant table to verify column names, data types, nullability, enums, foreign keys, and JSONB structures.
-4. Check for common LineCrush issues:
+4. Check for common schema issues:
    - the field is inside JSONB rather than top-level
    - the table or column name is slightly different than expected
-   - sport values need uppercase strings
+   - string values need exact casing (check enums and sample rows)
    - user identifiers differ across tables
-   - large odds or event tables need strong filters
+   - large event, log, or history tables need strong filters
 5. Rewrite the query with the correct schema assumptions.
 6. Test the corrected query and explain the fix clearly.
 
@@ -1167,9 +1164,9 @@ Use the database tools to prove the fix rather than guessing.`)
     case "trace_data_pipeline": {
       const pipelineName = requirePromptArg(args, "pipeline_name");
       return {
-        description: `Trace the ${pipelineName} data pipeline through the LineCrush database.`,
+        description: `Trace the ${pipelineName} data pipeline through this database.`,
         messages: [
-          promptTextMessage(`Trace the LineCrush data pipeline "${pipelineName}" through the database.
+          promptTextMessage(`Trace the data pipeline "${pipelineName}" through the database.
 
 Goal: explain how data moves from upstream ingestion or generation to downstream product behavior.
 
@@ -1500,16 +1497,16 @@ const PROMPTS = [
   {
     name: "understand_schema",
     title: "Understand Schema",
-    description: "Understand the LineCrush database at a high level before writing queries."
+    description: "Understand this database at a high level before writing queries."
   },
   {
     name: "investigate_product_surface",
     title: "Investigate Product Surface",
-    description: "Trace how a specific LineCrush product surface works in the database.",
+    description: "Trace how a specific product surface works in the database.",
     arguments: [
       {
         name: "surface_name",
-        description: "The LineCrush surface to investigate, such as picks, sonar, games, users, players, videos, x_scraper, or vibe_bet_generator.",
+        description: "The product surface to investigate, such as users, subscriptions, payments, orders, or notifications.",
         required: true
       }
     ]
@@ -1517,7 +1514,7 @@ const PROMPTS = [
   {
     name: "explore_table",
     title: "Explore Table",
-    description: "Deep-dive into a specific LineCrush table — structure, sample data, and relationships.",
+    description: "Deep-dive into a specific table — structure, sample data, and relationships.",
     arguments: [
       {
         name: "table_name",
@@ -1529,7 +1526,7 @@ const PROMPTS = [
   {
     name: "investigate_query_error",
     title: "Investigate Query Error",
-    description: "Debug a failing or unexpected SQL query against the LineCrush database.",
+    description: "Debug a failing or unexpected SQL query against this database.",
     arguments: [
       {
         name: "failing_sql",
@@ -1546,11 +1543,11 @@ const PROMPTS = [
   {
     name: "trace_data_pipeline",
     title: "Trace Data Pipeline",
-    description: "Follow how data moves through a specific LineCrush ingestion or product pipeline.",
+    description: "Follow how data moves through a specific ingestion or product pipeline.",
     arguments: [
       {
         name: "pipeline_name",
-        description: "The pipeline to trace, such as vibe_reports_to_vibe_bets, x_tweets_to_bot_analysis, or odds_feed_to_sonar.",
+        description: "The pipeline to trace, such as signups_to_subscriptions, orders_to_payments, or webhooks_to_events.",
         required: true
       }
     ]
@@ -2178,7 +2175,7 @@ async function getTableDescription(tableName, project) {
   }
 
   // Get JSONB column keys from a bounded sample of non-null rows. DISTINCT over
-  // the whole column detoasts every row (one vibe_bets call read 43 GB), so
+  // the whole column detoasts every row (one call on a large production table read 43 GB), so
   // sample first and cap the statement time. Both statements go in one
   // simple-query message, which runs as an implicit transaction, so SET LOCAL
   // bounds only this SELECT and costs no extra round trip.
