@@ -65,7 +65,7 @@ The `.env` file might not be automatically loaded. Solutions:
 If you can't connect to Neon:
 ```bash
 # Check DNS resolution
-nslookup ep-cool-night-a4fxktsc-pooler.us-east-1.aws.neon.tech
+nslookup ep-your-endpoint-pooler.us-east-1.aws.neon.tech
 
 # Test with curl
 curl -I https://neon.tech

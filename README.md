@@ -34,8 +34,8 @@ The server implements multiple versions to demonstrate different approaches:
 
 1. Clone this repository:
 ```bash
-git clone <repository-url>
-cd neon-pg-server
+git clone https://github.com/spragginsdesigns/neon-pg-mcp-server.git
+cd neon-pg-mcp-server
 ```
 
 2. Install dependencies:
@@ -53,7 +53,7 @@ export NEON_PG_CONNECTION_STRING="postgresql://user:password@host/database?sslmo
 | Variable | Required | Purpose |
 |----------|----------|---------|
 | `NEON_PG_CONNECTION_STRING` | one of the two | Single connection string, registered as the project named `default`. The original single-database setup — still fully supported. |
-| `NEON_PG_CONNECTIONS` | one of the three | JSON object mapping project names to connection strings, e.g. `{"versemind":"postgresql://...","linecrush":"postgresql://..."}`. Can be combined with `NEON_PG_CONNECTION_STRING`. |
+| `NEON_PG_CONNECTIONS` | one of the three | JSON object mapping project names to connection strings, e.g. `{"app":"postgresql://...","analytics":"postgresql://..."}`. Can be combined with `NEON_PG_CONNECTION_STRING`. |
 | `NEON_PG_CONNECTIONS_FILE` | one of the three | Path to a JSON file with the same name → connection-string map. Useful for sharing one connections map across many MCP registrations on a machine (keep the file out of version control, e.g. `~/.secrets/neon-connections.json`). |
 | `NEON_PG_READONLY_PROJECTS` | no | Comma-separated project names for which the `execute` tool is refused outright (reads still work). |
 
@@ -69,9 +69,9 @@ One server instance can serve several Neon projects. Pools are created lazily pe
     "command": "node",
     "args": ["/path/to/neon-pg-server/pg-mcp-server.js"],
     "env": {
-      "NEON_PG_CONNECTION_STRING": "postgresql://user:pw@ep-old-host.aws.neon.tech/verceldb?sslmode=require",
-      "NEON_PG_CONNECTIONS": "{\"versemind\":\"postgresql://user:pw@ep-vm-host.aws.neon.tech/neondb?sslmode=require\",\"linecrush\":\"postgresql://user:pw@ep-lc-host.aws.neon.tech/verceldb?sslmode=require\"}",
-      "NEON_PG_READONLY_PROJECTS": "linecrush"
+      "NEON_PG_CONNECTION_STRING": "postgresql://user:pw@ep-example-1.aws.neon.tech/verceldb?sslmode=require",
+      "NEON_PG_CONNECTIONS": "{\"app\":\"postgresql://user:pw@ep-example-2.aws.neon.tech/neondb?sslmode=require\",\"analytics\":\"postgresql://user:pw@ep-example-3.aws.neon.tech/verceldb?sslmode=require\"}",
+      "NEON_PG_READONLY_PROJECTS": "analytics"
     }
   }
 }
@@ -79,8 +79,8 @@ One server instance can serve several Neon projects. Pools are created lazily pe
 
 With this config:
 - `get_tables` with no arguments runs against `default` (the legacy connection string) — existing setups keep working unchanged.
-- `get_tables` with `project: "versemind"` runs against the versemind database.
-- `execute` with `project: "linecrush"` is refused because linecrush is in `NEON_PG_READONLY_PROJECTS`.
+- `get_tables` with `project: "app"` runs against the app database.
+- `execute` with `project: "analytics"` is refused because analytics is in `NEON_PG_READONLY_PROJECTS`.
 - `list_projects` shows all three names with their host and database (never credentials).
 
 **Default project resolution:** the project named `default` (from `NEON_PG_CONNECTION_STRING` or a `default` key in `NEON_PG_CONNECTIONS`) is the default for read tools. If no `default` exists but exactly one project is configured, that one is the default. With multiple named projects and no `default`, read tools require an explicit `project` argument.
